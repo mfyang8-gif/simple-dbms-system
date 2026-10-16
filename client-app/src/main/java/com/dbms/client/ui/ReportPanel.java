@@ -5,6 +5,7 @@ import com.dbms.client.service.ReportService;
 import org.jfree.chart.ChartFactory;
 import org.jfree.chart.ChartPanel;
 import org.jfree.chart.JFreeChart;
+import org.jfree.chart.StandardChartTheme;
 import org.jfree.data.category.DefaultCategoryDataset;
 import org.jfree.data.general.DefaultPieDataset;
 
@@ -13,10 +14,19 @@ import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.io.File;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 
-/** 统计与报表（子系统五）：图形展示 + 月度单据 + 账本 + PDF/Excel 导出。 */
+/**
+ * 统计与报表（子系统五）：图形展示 + 月度单据 + 账本 + PDF/Excel 导出。
+ *
+ * 【第 1 课】工具栏新增日期区间输入框，按时间段统计。
+ * 【第 2 课】新增"图表类型"下拉框，可切换柱状图 / 折线图 / 饼图。
+ *           知识点：同一份数据喂给不同的 ChartFactory 方法就得到不同图形，
+ *           因此每个报表同时准备 CategoryDataset（柱状/折线）与 PieDataset（饼图）。
+ */
 public class ReportPanel extends JPanel {
 
     private final ReportService service = new ReportService();
@@ -24,11 +34,19 @@ public class ReportPanel extends JPanel {
     private final JComboBox<String> typeBox = new JComboBox<>(new String[]{
             "按物料流量统计", "月度进出仓趋势", "月度进出仓单", "物料仓库账本"});
 
+    /** 第 2 课新增：图表类型。 */
+    private final JComboBox<String> chartBox = new JComboBox<>(new String[]{
+            "柱状图", "折线图", "饼图"});
+
     private final JSpinner yearSpinner =
             new JSpinner(new SpinnerNumberModel(LocalDate.now().getYear(), 2000, 2100, 1));
 
     private final JComboBox<String> monthBox = new JComboBox<>(new String[]{
             "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"});
+
+    // 第 1 课新增：日期区间输入
+    private final JTextField fromField = new JTextField("2025-01-01", 9);
+    private final JTextField toField = new JTextField("2025-12-31", 9);
 
     private final DefaultTableModel model = new DefaultTableModel() {
         @Override
@@ -45,6 +63,8 @@ public class ReportPanel extends JPanel {
     private String currentTitle = "报表";
 
     public ReportPanel() {
+        setupChartFont();
+
         setLayout(new BorderLayout(8, 8));
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
@@ -60,112 +80,305 @@ public class ReportPanel extends JPanel {
         doQuery();
     }
 
+    /**
+     * 修复 JFreeChart 中文乱码：给它换一套含中文的字体主题。
+     * 必须在创建任何图表之前调用（全局生效，调用一次即可）。
+     */
+    private static void setupChartFont() {
+        Font font = new Font("微软雅黑", Font.PLAIN, 13);
+        StandardChartTheme theme = new StandardChartTheme("CN");
+        theme.setExtraLargeFont(font.deriveFont(Font.BOLD, 16f));   // 图表标题
+        theme.setLargeFont(font.deriveFont(13f));                   // 坐标轴标题
+        theme.setRegularFont(font);                                 // 刻度、图例
+        theme.setSmallFont(font.deriveFont(11f));
+        ChartFactory.setChartTheme(theme);
+    }
+
     private JComponent buildToolbar() {
-        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
-        panel.setBorder(BorderFactory.createTitledBorder("报表参数"));
+        // 两行布局：第一行 = 查询条件；第二行 = 图表类型 + 生成 + 导出
+        // （一行放不下这么多控件，会被挤出屏幕右边）
+        JPanel rows = new JPanel();
+        rows.setLayout(new BoxLayout(rows, BoxLayout.Y_AXIS));
+        rows.setBorder(BorderFactory.createTitledBorder("报表参数"));
 
-        panel.add(new JLabel("统计类型："));
-        typeBox.addActionListener(e -> updateMonthEnabled());
-        panel.add(typeBox);
+        // ---- 第一行：日期 + 统计类型 + 年月 ----
+        JPanel conditions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
 
-        panel.add(new JLabel("年份："));
-        panel.add(yearSpinner);
+        conditions.add(new JLabel("起始日期："));
+        conditions.add(fromField);
+        conditions.add(new JLabel("结束日期："));
+        conditions.add(toField);
+        fromField.setToolTipText("格式 2025-09-01，留空表示不限");
+        toField.setToolTipText("格式 2025-12-31，留空表示不限");
+        // 文本框不会因为"打字"触发事件；绑上回车键 = 在框里按 Enter 立即查询
+        fromField.addActionListener(e -> doQuery());
+        toField.addActionListener(e -> doQuery());
 
-        panel.add(new JLabel("月份："));
-        panel.add(monthBox);
+        conditions.add(new JLabel("统计类型："));
+        // 切换统计类型时：① 更新月份输入框可用状态 ② 立即重新查询并重绘
+        typeBox.addActionListener(e -> {
+            updateMonthEnabled();
+            doQuery();
+        });
+        conditions.add(typeBox);
+
+        conditions.add(new JLabel("年份："));
+        yearSpinner.addChangeListener(e -> doQuery());
+        conditions.add(yearSpinner);
+
+        conditions.add(new JLabel("月份："));
+        monthBox.addActionListener(e -> doQuery());
+        conditions.add(monthBox);
+
+        // ---- 第二行：图表类型 + 按钮 ----
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
+
+        actions.add(new JLabel("图表："));
+        chartBox.addActionListener(e -> doQuery());
+        actions.add(chartBox);
 
         JButton queryButton = new JButton("生成报表");
         queryButton.addActionListener(e -> doQuery());
-        panel.add(queryButton);
+        actions.add(queryButton);
 
-        panel.add(new JLabel("   "));
+        actions.add(new JLabel("   "));
 
         JButton excelButton = new JButton("导出 Excel");
         excelButton.addActionListener(e -> exportExcel());
-        panel.add(excelButton);
+        actions.add(excelButton);
 
         JButton pdfButton = new JButton("导出 PDF");
         pdfButton.addActionListener(e -> exportPdf());
-        panel.add(pdfButton);
+        actions.add(pdfButton);
 
         JButton pngButton = new JButton("导出图表 PNG");
         pngButton.addActionListener(e -> exportChartPng());
-        panel.add(pngButton);
+        actions.add(pngButton);
 
-        return panel;
+        // 第 3 课：打印单据（Swing 自带，不需要第三方库）
+        JButton printButton = new JButton("打印单据");
+        printButton.addActionListener(e -> printBill());
+        actions.add(printButton);
+
+        rows.add(conditions);
+        rows.add(actions);
+        return rows;
     }
 
     private void updateMonthEnabled() {
         monthBox.setEnabled(typeBox.getSelectedIndex() == 2);
     }
 
+    /** 空串放行（表示不限），否则必须是 yyyy-MM-dd。 */
+    private boolean checkDate(String s) {
+        return s.isEmpty() || s.matches("^\\d{4}-\\d{2}-\\d{2}$");
+    }
+
     // ---------------- 生成报表 ----------------
 
     private void doQuery() {
+        String from = fromField.getText().trim();
+        String to = toField.getText().trim();
+        if (!checkDate(from) || !checkDate(to)) {
+            JOptionPane.showMessageDialog(this,
+                    "日期格式应为 yyyy-MM-dd，例如 2025-09-01（留空表示不限）",
+                    "格式错误", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        if (!from.isEmpty() && !to.isEmpty() && from.compareTo(to) > 0) {
+            JOptionPane.showMessageDialog(this,
+                    "起始日期不能晚于结束日期", "格式错误", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
         int type = typeBox.getSelectedIndex();
         int year = (Integer) yearSpinner.getValue();
         int month = monthBox.getSelectedIndex() + 1;
         try {
             switch (type) {
-                case 0 -> loadFlow();
-                case 1 -> loadMonthly(year);
-                case 2 -> loadMonthBill(year, month);
-                default -> loadLedger();
+                case 0 -> loadFlow(from, to);
+                case 1 -> loadMonthly(year, from, to);
+                case 2 -> loadMonthBill(year, month, from, to);
+                default -> loadLedger(from, to);
             }
         } catch (Exception ex) {
             showError(ex);
         }
     }
 
-    private void loadFlow() {
-        List<ReportService.FlowRow> list = service.flowByMaterial();
+    private void loadFlow(String from, String to) {
+        List<ReportService.FlowRow> list = service.flowByMaterial(from, to);
         List<Object[]> rows = new ArrayList<>();
-        DefaultCategoryDataset dataset = new DefaultCategoryDataset();
+        DefaultCategoryDataset bar = new DefaultCategoryDataset();
+        DefaultPieDataset<String> pie = new DefaultPieDataset<>();
         for (ReportService.FlowRow f : list) {
             rows.add(new Object[]{f.code, f.name, f.unit, f.inQty, f.outQty, f.stock});
-            dataset.addValue(f.inQty, "进仓", f.name);
-            dataset.addValue(f.outQty, "出仓", f.name);
+            bar.addValue(f.inQty, "进仓", f.name);
+            bar.addValue(f.outQty, "出仓", f.name);
+            if (f.inQty > 0) {
+                pie.setValue(f.name + " 进仓", f.inQty);
+            }
         }
         currentTitle = "按物料进出仓流量对比";
         apply(ReportService.FLOW_HEADERS, rows,
-                ChartFactory.createBarChart(currentTitle, "物料", "数量", dataset));
+                makeChart(currentTitle, "物料", "数量", bar, pie));
     }
 
-    private void loadMonthly(int year) {
-        int[][] monthly = service.monthlyFlow(year);
+    private void loadMonthly(int year, String from, String to) {
+        int[][] monthly = service.monthlyFlow(year, from, to);
         List<Object[]> rows = new ArrayList<>();
-        DefaultCategoryDataset dataset = new DefaultCategoryDataset();
+        DefaultCategoryDataset bar = new DefaultCategoryDataset();
+        DefaultPieDataset<String> pie = new DefaultPieDataset<>();
         for (int i = 0; i < 12; i++) {
             rows.add(new Object[]{(i + 1) + "月", monthly[i][0], monthly[i][1]});
-            dataset.addValue(monthly[i][0], "进仓", (i + 1) + "月");
-            dataset.addValue(monthly[i][1], "出仓", (i + 1) + "月");
+            bar.addValue(monthly[i][0], "进仓", (i + 1) + "月");
+            bar.addValue(monthly[i][1], "出仓", (i + 1) + "月");
+            if (monthly[i][0] > 0) {
+                pie.setValue((i + 1) + "月进仓", monthly[i][0]);
+            }
         }
         currentTitle = year + " 年月度进出仓趋势";
         apply(new String[]{"月份", "进仓合计", "出仓合计"}, rows,
-                ChartFactory.createBarChart(currentTitle, "月份", "数量", dataset));
+                makeChart(currentTitle, "月份", "数量", bar, pie));
     }
 
-    private void loadMonthBill(int year, int month) {
-        List<Object[]> rows = service.monthBill(year, month);
-        currentTitle = String.format("%04d-%02d 月度进出仓单", year, month);
-        apply(ReportService.MONTH_BILL_HEADERS, rows, null);
+    /**
+     * 第 3 课：月度进出仓单 —— 明细 + 合计行 + 单据抬头。
+     * 这块不是"图表"，所以要把 chartHolder 里的内容换成抬头面板。
+     */
+    private void loadMonthBill(int year, int month, String from, String to) {
+        List<Object[]> detail = (from.isEmpty() && to.isEmpty())
+                ? service.monthBill(year, month)
+                : service.monthBillByRange(from, to);
+
+        // ① 算合计：把明细里的数量按"进仓/出仓"分别累加
+        int inTotal = 0;
+        int outTotal = 0;
+        for (Object[] r : detail) {
+            String kind = String.valueOf(r[4]);            // 第 5 列是"类型"
+            int qty = ((Number) r[5]).intValue();          // 第 6 列是"数量"
+            if (kind.startsWith("进")) {
+                inTotal += qty;
+            } else {
+                outTotal += qty;
+            }
+        }
+
+        // ② 明细后面追加合计行（就是往表格模型里多塞两行数据）
+        List<Object[]> rows = new ArrayList<>(detail);
+        if (!detail.isEmpty()) {
+            rows.add(new Object[]{"合计", "", "", "", "进仓", inTotal, "", "", detail.size() + " 笔"});
+            rows.add(new Object[]{"", "", "", "", "出仓", outTotal, "", "", ""});
+        }
+
+        String period = (!from.isEmpty() || !to.isEmpty())
+                ? (from.isEmpty() ? "最早" : from) + " ~ " + (to.isEmpty() ? "最新" : to)
+                : String.format("%04d-%02d", year, month);
+        currentTitle = period + " 进出仓单";
+
+        currentHeaders = ReportService.MONTH_BILL_HEADERS;
+        currentRows = rows;
+        currentChart = null;
+        model.setDataVector(rows.toArray(new Object[0][]), ReportService.MONTH_BILL_HEADERS);
+
+        // ③ 把 chartHolder 换成单据抬头
+        showBillHeader(period, detail.size(), inTotal, outTotal);
     }
 
-    private void loadLedger() {
-        List<ReportService.LedgerRow> list = service.ledger();
+    /** 在原本放图表的位置显示"单据抬头"。 */
+    private void showBillHeader(String period, int count, int inTotal, int outTotal) {
+        JPanel header = new JPanel();
+        header.setLayout(new BoxLayout(header, BoxLayout.Y_AXIS));
+        header.setBorder(BorderFactory.createEmptyBorder(14, 20, 14, 20));
+
+        JLabel title = new JLabel("简易仓库管理系统 —— 物料进出仓单");
+        title.setFont(new Font("微软雅黑", Font.BOLD, 20));
+        title.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+        JLabel periodLabel = new JLabel("统计期间：" + period);
+        periodLabel.setFont(new Font("微软雅黑", Font.PLAIN, 13));
+        periodLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+        JLabel timeLabel = new JLabel("制表时间："
+                + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")));
+        timeLabel.setFont(new Font("微软雅黑", Font.PLAIN, 13));
+        timeLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+        JLabel sumLabel = new JLabel(String.format(
+                "共 %d 笔　进仓合计：%d　出仓合计：%d", count, inTotal, outTotal));
+        sumLabel.setFont(new Font("微软雅黑", Font.BOLD, 14));
+        sumLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+        header.add(title);
+        header.add(Box.createVerticalStrut(8));
+        header.add(periodLabel);
+        header.add(Box.createVerticalStrut(4));
+        header.add(timeLabel);
+        header.add(Box.createVerticalStrut(8));
+        header.add(sumLabel);
+
+        chartHolder.removeAll();
+        chartHolder.add(header, BorderLayout.CENTER);
+        chartHolder.revalidate();
+        chartHolder.repaint();
+    }
+
+    /** 第 3 课：打印当前表格（弹出系统打印对话框，可预览、可选打印机）。 */
+    private void printBill() {
+        if (currentRows.isEmpty()) {
+            warn("当前没有数据可打印");
+            return;
+        }
+        try {
+            boolean done = table.print(JTable.PrintMode.FIT_WIDTH,
+                    new java.text.MessageFormat(currentTitle),
+                    new java.text.MessageFormat("第 {0} 页 / 共 {1} 页"));
+            if (done) {
+                warn("已提交打印任务");
+            }
+        } catch (Exception ex) {
+            showError(ex);
+        }
+    }
+
+    private void loadLedger(String from, String to) {
+        List<ReportService.LedgerRow> list = service.ledger(from, to);
         List<Object[]> rows = new ArrayList<>();
+        DefaultCategoryDataset bar = new DefaultCategoryDataset();
         DefaultPieDataset<String> pie = new DefaultPieDataset<>();
-        int total = 0;
         for (ReportService.LedgerRow r : list) {
             rows.add(new Object[]{r.code, r.name, r.unit, r.opening, r.inQty, r.outQty, r.closing});
+            bar.addValue(r.inQty, "入库", r.name);
+            bar.addValue(r.outQty, "出库", r.name);
             if (r.closing > 0) {
                 pie.setValue(r.name, r.closing);
-                total += r.closing;
             }
         }
         currentTitle = "物料仓库账本";
         apply(ReportService.LEDGER_HEADERS, rows,
-                total > 0 ? ChartFactory.createPieChart("当前库存占比", pie) : null);
+                makeChart(currentTitle, "物料", "数量", bar, pie));
+    }
+
+    /**
+     * 第 2 课核心：按"图表类型"下拉框的选择生成图形。
+     *
+     * @param bar 柱状图 / 折线图用的数据源（有横轴概念）
+     * @param pie 饼图用的数据源（只有"名称→数值"）；null 表示该报表不支持饼图
+     * @return 生成的图表；null 表示"当前类型下不画图"
+     */
+    private JFreeChart makeChart(String title, String catAxis, String valAxis,
+                                 DefaultCategoryDataset bar, DefaultPieDataset<String> pie) {
+        String kind = (String) chartBox.getSelectedItem();
+        if ("饼图".equals(kind)) {
+            if (pie == null || pie.getKeys().isEmpty()) {
+                return null;                       // 没数据就别硬画
+            }
+            return ChartFactory.createPieChart(title, pie);
+        }
+        if ("折线图".equals(kind)) {
+            return ChartFactory.createLineChart(title, catAxis, valAxis, bar);
+        }
+        return ChartFactory.createBarChart(title, catAxis, valAxis, bar);
     }
 
     private void apply(String[] headers, List<Object[]> rows, JFreeChart chart) {
@@ -181,7 +394,8 @@ public class ReportPanel extends JPanel {
         if (chart != null) {
             chartHolder.add(new ChartPanel(chart), BorderLayout.CENTER);
         } else {
-            chartHolder.add(new JLabel("该报表以表格形式呈现，无图形。", SwingConstants.CENTER), BorderLayout.CENTER);
+            chartHolder.add(new JLabel("该报表当前类型下无图形（或数据为空）。",
+                    SwingConstants.CENTER), BorderLayout.CENTER);
         }
         chartHolder.revalidate();
         chartHolder.repaint();
