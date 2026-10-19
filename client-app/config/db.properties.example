@@ -1,0 +1,17 @@
+# ============================================================
+# 数据库连接配置模板
+# 用法：复制一份改名为 db.properties，然后填入你本机的密码
+#   config/db.properties 已被 git 忽略，各人维护自己的本地配置
+# ============================================================
+db.driver=com.mysql.cj.jdbc.Driver
+db.url=jdbc:mysql://127.0.0.1:3306/dbms_course?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8
+db.user=root
+db.password=改成你自己的MySQL密码
+
+# ============================================================
+# 后期：切换到 Rust 引擎时，注释掉上面 4 行，改成下面 2 行
+# ⚠️ 驱动取决于引擎实现的是"标准 PostgreSQL 协议"还是"自定义协议"，
+#    必须和底层同学确认后再填！
+# ============================================================
+# db.driver=org.postgresql.Driver
+# db.url=jdbc:postgresql://127.0.0.1:5432/dbms_course

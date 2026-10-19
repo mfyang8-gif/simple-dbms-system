@@ -1,0 +1,5 @@
+# IDEA 模块配置文件（自动生成，不应提交）
+*.iml
+
+# 本机私有数据库配置（含密码，不进仓库；模板见 config/db.properties.example）
+config/db.local.properties

@@ -30,6 +30,13 @@ public final class DbUtil {
                     }
                 }
             }
+            // 本机私有配置覆盖（含密码，不进仓库）：存在则覆盖同名项
+            Path local = Path.of("config", "db.local.properties");
+            if (Files.exists(local)) {
+                try (InputStream in = Files.newInputStream(local)) {
+                    CFG.load(in);
+                }
+            }
             String driver = CFG.getProperty("db.driver", "com.mysql.cj.jdbc.Driver");
             Class.forName(driver);
         } catch (Exception e) {
