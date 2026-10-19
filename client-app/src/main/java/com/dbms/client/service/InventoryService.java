@@ -54,23 +54,24 @@ public class InventoryService {
         }
         boolean inbound = IN.equalsIgnoreCase(opType);
 
-        // 阶段①：事务外先做预校验，库存不足直接拒绝，不浪费一次数据库往返
+        // 阶段①：事务外的轻量校验 —— 只校验数量合法性与物料是否存在
+        // 注意：库存是否充足**故意不在这里判断**，而是放到事务内逐条判断，
+        //      否则"库存不足"会在事务开始前就抛异常，rollback 分支永远不会被执行，
+        //      既掩盖了事务回滚能力，也无法演示"前几条已扣、整批撤销"的效果。
         Map<Integer, Integer> needMap = new LinkedHashMap<>();
+        Map<Integer, String> nameMap = new LinkedHashMap<>();
         for (Item it : items) {
             if (it.qty <= 0) {
                 throw new IllegalArgumentException("数量必须大于 0");
             }
             needMap.merge(it.materialCode, it.qty, Integer::sum);
         }
-        for (Map.Entry<Integer, Integer> e : needMap.entrySet()) {
-            Material m = materialDao.findById(e.getKey());
+        for (Integer code : needMap.keySet()) {
+            Material m = materialDao.findById(code);
             if (m == null) {
-                throw new IllegalArgumentException("物料不存在：" + e.getKey());
+                throw new IllegalArgumentException("物料不存在：" + code);
             }
-            if (!inbound && m.getStockQty() < e.getValue()) {
-                throw new IllegalStateException("库存不足：" + m.getName()
-                        + "（现有 " + m.getStockQty() + "，本单需要 " + e.getValue() + "）");
-            }
+            nameMap.put(code, m.getName());
         }
 
         // 阶段②：真正的强事务
@@ -82,7 +83,13 @@ public class InventoryService {
             conn.setAutoCommit(false);      // 等价于发送 BEGIN
 
             for (Item it : items) {
+                // 逐条查询库存：同一条连接能看到本事务内上一条 UPDATE 的结果，
+                // 因此同一物料在一单里出现多次也能被正确拦截（不会扣成负数）
                 int stock = queryStock(conn, it.materialCode);
+                if (!inbound && stock < it.qty) {
+                    throw new IllegalStateException("库存不足：" + nameMap.get(it.materialCode)
+                            + "（现有 " + stock + "，本单需要 " + it.qty + "）");
+                }
                 int newStock = inbound ? stock + it.qty : stock - it.qty;
 
                 exec(conn, "UPDATE materials SET stock_qty = " + newStock
