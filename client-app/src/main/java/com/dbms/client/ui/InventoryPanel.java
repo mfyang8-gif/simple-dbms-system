@@ -1,22 +1,36 @@
 package com.dbms.client.ui;
 
+import com.dbms.client.dao.MaterialDao;
+import com.dbms.client.entity.Material;
 import com.dbms.client.entity.Personnel;
 import com.dbms.client.service.InventoryService;
 import com.dbms.client.util.RegexValidator;
 
 import javax.swing.*;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.util.ArrayList;
 import java.util.List;
 
-/** 单物料 / 多物料进出仓 + 流水查询（子系统二、三）。 */
+/**
+ * 单物料 / 多物料进出仓 + 流水查询（子系统二、三）。
+ *
+ * 【第 5 课】单物料栏从"手输物料代码"改为"下拉选择物料"，
+ *           并在输入数量时实时提示库存变化（出仓超量会标红）。
+ */
 public class InventoryPanel extends JPanel {
 
     private final InventoryService service = new InventoryService();
+    private final MaterialDao materialDao = new MaterialDao();
     private final Personnel currentUser;
 
-    private final JTextField codeField = new JTextField(6);
+    /** 第 5 课：物料下拉框（显示 代码 · 名称（库存 单位））。 */
+    private final JComboBox<Material> materialBox = new JComboBox<>();
+    /** 第 5 课：库存实时提示。 */
+    private final JLabel stockLabel = new JLabel(" ");
+
     private final JTextField qtyField = new JTextField(6);
     private final JComboBox<String> typeBox = new JComboBox<>(new String[]{"进仓", "出仓"});
     private final JTextField remarksField = new JTextField(16);
@@ -48,31 +62,67 @@ public class InventoryPanel extends JPanel {
 
         add(new JScrollPane(table), BorderLayout.CENTER);
 
+        loadMaterials();
         reload();
     }
 
     private JComponent buildSingleMoveBar() {
-        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
-        panel.setBorder(BorderFactory.createTitledBorder("单物料进出仓"));
+        // 两行：第一行是输入控件，第二行是库存提示（一行放不下，会被挤出去）
+        JPanel rows = new JPanel();
+        rows.setLayout(new BoxLayout(rows, BoxLayout.Y_AXIS));
+        rows.setBorder(BorderFactory.createTitledBorder("单物料进出仓"));
 
-        panel.add(new JLabel("物料代码："));
-        panel.add(codeField);
-        panel.add(new JLabel("数量："));
-        panel.add(qtyField);
-        panel.add(new JLabel("类型："));
-        panel.add(typeBox);
-        panel.add(new JLabel("备注："));
-        panel.add(remarksField);
+        JPanel inputs = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
+
+        inputs.add(new JLabel("物料："));
+        materialBox.setPreferredSize(new Dimension(260, 26));
+        materialBox.setRenderer(new MaterialRenderer());
+        inputs.add(materialBox);
+
+        inputs.add(new JLabel("数量："));
+        inputs.add(qtyField);
+
+        inputs.add(new JLabel("类型："));
+        inputs.add(typeBox);
+
+        inputs.add(new JLabel("备注："));
+        inputs.add(remarksField);
 
         JButton submitButton = new JButton("提交");
         submitButton.addActionListener(e -> doSingleMove());
-        panel.add(submitButton);
+        inputs.add(submitButton);
 
         JButton multiButton = new JButton("多物料进出仓…");
         multiButton.addActionListener(e -> openMultiDialog());
-        panel.add(multiButton);
+        inputs.add(multiButton);
 
-        return panel;
+        // 监听：换物料 / 改数量 / 换类型，都刷新提示
+        materialBox.addActionListener(e -> updateStockPreview());
+        typeBox.addActionListener(e -> updateStockPreview());
+        qtyField.getDocument().addDocumentListener(new DocumentListener() {
+            @Override
+            public void insertUpdate(DocumentEvent e) {
+                updateStockPreview();
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e) {
+                updateStockPreview();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e) {
+                updateStockPreview();
+            }
+        });
+
+        JPanel preview = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        stockLabel.setFont(new Font("微软雅黑", Font.PLAIN, 13));
+        preview.add(stockLabel);
+
+        rows.add(inputs);
+        rows.add(preview);
+        return rows;
     }
 
     private JComponent buildQueryBar() {
@@ -102,25 +152,110 @@ public class InventoryPanel extends JPanel {
         return panel;
     }
 
+    // ---------------- 第 5 课：物料下拉 + 库存提示 ----------------
+
+    /** 重新载入物料列表（进出仓后库存会变，必须刷新）。 */
+    private void loadMaterials() {
+        Integer keepCode = null;
+        Material selected = (Material) materialBox.getSelectedItem();
+        if (selected != null) {
+            keepCode = selected.getMaterialCode();
+        }
+        try {
+            materialBox.removeAllItems();
+            for (Material m : materialDao.search("")) {
+                materialBox.addItem(m);
+            }
+            // 尽量保持原来选中项，避免刷新后跳到第一行
+            if (keepCode != null) {
+                for (int i = 0; i < materialBox.getItemCount(); i++) {
+                    if (materialBox.getItemAt(i).getMaterialCode() == keepCode) {
+                        materialBox.setSelectedIndex(i);
+                        break;
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            showError(ex);
+        }
+        updateStockPreview();
+    }
+
+    /** 根据所选物料 / 类型 / 数量，实时显示"当前库存 → 操作后库存"。 */
+    private void updateStockPreview() {
+        Material m = (Material) materialBox.getSelectedItem();
+        if (m == null) {
+            stockLabel.setText("（物料列表为空，请先在「物料档案」中新增物料）");
+            stockLabel.setForeground(Color.GRAY);
+            return;
+        }
+        boolean inbound = typeBox.getSelectedIndex() == 0;
+        int stock = m.getStockQty();
+        String unit = m.getUnit() == null ? "" : m.getUnit();
+
+        int qty = 0;
+        String text = qtyField.getText().trim();
+        if (RegexValidator.isPositiveInt(text)) {
+            qty = Integer.parseInt(text);
+        }
+
+        if (qty <= 0) {
+            stockLabel.setText("当前库存 " + stock + " " + unit);
+            stockLabel.setForeground(new Color(0x44, 0x44, 0x41));
+            return;
+        }
+        if (inbound) {
+            stockLabel.setText("当前库存 " + stock + " " + unit + " → 进仓后 " + (stock + qty) + " " + unit);
+            stockLabel.setForeground(new Color(0x0F, 0x6E, 0x56));
+        } else {
+            int after = stock - qty;
+            if (after < 0) {
+                stockLabel.setText("⚠ 库存不足：当前只有 " + stock + " " + unit + "，最多可出 " + stock + " " + unit);
+                stockLabel.setForeground(new Color(0xA3, 0x2D, 0x2D));
+            } else {
+                stockLabel.setText("当前库存 " + stock + " " + unit + " → 出仓后剩余 " + after + " " + unit);
+                stockLabel.setForeground(new Color(0x0F, 0x6E, 0x56));
+            }
+        }
+    }
+
+    /** 下拉框渲染：显示 "1001 · 螺丝  M4x10（库存 150 个）"。 */
+    private static class MaterialRenderer extends DefaultListCellRenderer {
+        @Override
+        public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                      boolean isSelected, boolean cellHasFocus) {
+            super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+            if (value instanceof Material m) {
+                String spec = m.getSpec() == null || m.getSpec().isBlank() ? "" : " " + m.getSpec();
+                setText(m.getMaterialCode() + " · " + m.getName() + spec
+                        + "（库存 " + m.getStockQty() + " " + (m.getUnit() == null ? "" : m.getUnit()) + "）");
+            }
+            return this;
+        }
+    }
+
     // ---------------- 单物料 ----------------
 
     private void doSingleMove() {
-        if (!RegexValidator.isPositiveInt(codeField.getText())) {
-            warn("物料代码必须是正整数");
+        Material m = (Material) materialBox.getSelectedItem();
+        if (m == null) {
+            warn("请先选择物料");
             return;
         }
         if (!RegexValidator.isPositiveInt(qtyField.getText())) {
             warn("数量必须是正整数");
             return;
         }
+        int qty = Integer.parseInt(qtyField.getText().trim());
         String opType = typeBox.getSelectedIndex() == 0 ? InventoryService.IN : InventoryService.OUT;
         try {
-            service.singleMove(Integer.parseInt(codeField.getText().trim()), opType,
-                    Integer.parseInt(qtyField.getText().trim()), currentUser.getId(), remarksField.getText().trim());
-            JOptionPane.showMessageDialog(this, "操作成功");
-            codeField.setText("");
+            service.singleMove(m.getMaterialCode(), opType, qty, currentUser.getId(),
+                    remarksField.getText().trim());
+            JOptionPane.showMessageDialog(this,
+                    "操作成功：" + m.getName() + " " + (InventoryService.IN.equals(opType) ? "进仓 " : "出仓 ") + qty);
             qtyField.setText("");
             remarksField.setText("");
+            loadMaterials();     // 库存变了，刷新下拉框
             reload();
         } catch (Exception ex) {
             showError(ex);
@@ -181,6 +316,7 @@ public class InventoryPanel extends JPanel {
                 service.multiMove(items, opType, currentUser.getId(), dialogRemarks.getText().trim());
                 JOptionPane.showMessageDialog(dialog, "本单已全部提交成功");
                 dialog.dispose();
+                loadMaterials();
                 reload();
             } catch (Exception ex) {
                 JOptionPane.showMessageDialog(dialog, ex.getMessage(), "提交失败（已回滚）", JOptionPane.ERROR_MESSAGE);
