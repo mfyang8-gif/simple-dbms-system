@@ -28,6 +28,7 @@ pub type SharedPage = Arc<RwLock<Page>>;
 
 /// Clock 算法的环形数组条目
 struct ClockEntry {
+    #[allow(dead_code)]
     page_id: u32,
     page: SharedPage,
 }

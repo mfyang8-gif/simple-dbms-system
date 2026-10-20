@@ -155,152 +155,127 @@ pub fn undo(
     Ok(())
 }
 
-/// 端到端入口：从日志文件路径读出记录 → 交给 analyze
-pub fn analysis_from_log(path: &str) -> std::io::Result<TxnTable> {
-    let records = LogManager::read_all(path)?;
-    Ok(analyze(&records))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recovery::log_record::LogRecord;
 
-    /// 纯单测：只喂记录，不碰磁盘
     #[test]
     fn test_analysis_winners_and_losers() {
         let recs = vec![
             (10, LogRecord::Begin { txn_id: 1 }),
-            (11, LogRecord::Commit { txn_id: 1 }),   // txn1 赢家
-            (12, LogRecord::Begin { txn_id: 2 }),    // txn2 只有 Begin → 输家
+            (11, LogRecord::Commit { txn_id: 1 }),
+            (12, LogRecord::Begin { txn_id: 2 }),
             (13, LogRecord::Begin { txn_id: 3 }),
-            (14, LogRecord::Abort { txn_id: 3 }),    // txn3 显式 abort → 输家
+            (14, LogRecord::Abort { txn_id: 3 }),
         ];
         let t = analyze(&recs);
-        assert_eq!(t.get(&1), Some(&TxnStats { is_winner: true,  last_lsn: 11 }));
+        assert_eq!(t.get(&1), Some(&TxnStats { is_winner: true, last_lsn: 11 }));
         assert_eq!(t.get(&2), Some(&TxnStats { is_winner: false, last_lsn: 12 }));
         assert_eq!(t.get(&3), Some(&TxnStats { is_winner: false, last_lsn: 14 }));
     }
 
     #[test]
+    fn test_analysis_update_advances_last_lsn_only() {
+        let recs = vec![
+            (20, LogRecord::Begin { txn_id: 1 }),
+            (21, LogRecord::Update { txn_id: 1, prev_lsn: 20, page_id: 7, offset: 0, before: vec![0], after: vec![1] }),
+            (22, LogRecord::Update { txn_id: 1, prev_lsn: 21, page_id: 7, offset: 4, before: vec![0; 4], after: vec![1; 4] }),
+        ];
+        let t = analyze(&recs);
+        assert_eq!(t.get(&1), Some(&TxnStats { is_winner: false, last_lsn: 22 }));
+    }
+
+    #[test]
+    fn test_apply_update_writes_after_image() {
+        let mut page = Page::new(42);
+        page.write_data(100, &[0xAA, 0xAA, 0xAA]);
+        PageHeader::write_page_lsn(&mut page, INVALID_LSN);
+        apply_update_to_page(&mut page, 100, 42, 100, &[0x11, 0x22, 0x33]);
+        assert_eq!(page.read_data(100, 3), &[0x11, 0x22, 0x33]);
+        assert_eq!(PageHeader::read_page_lsn(&page), 100);
+    }
+
+    #[test]
+    fn test_apply_update_is_idempotent() {
+        let mut page = Page::new(42);
+        PageHeader::write_page_lsn(&mut page, 200);
+        let snapshot = page.read_data(100, 3).to_vec();
+        apply_update_to_page(&mut page, 100, 42, 100, &[0x99, 0x99, 0x99]);
+        assert_eq!(page.read_data(100, 3), &snapshot[..]);
+        assert_eq!(PageHeader::read_page_lsn(&page), 200);
+    }
+
+    #[test]
     fn test_apply_undo_writes_before_image() {
         let mut page = Page::new(42);
-        // 模拟 redo 之后的状态：页上已是 after = [0x11, 0x22, 0x33]
         page.write_data(100, &[0x11, 0x22, 0x33]);
         PageHeader::write_page_lsn(&mut page, 50);
-
-        // undo：把 before = [0xAA, 0xAA, 0xAA] 写回
         apply_undo_to_page(&mut page, 50, 42, 100, &[0xAA, 0xAA, 0xAA]);
-
         assert_eq!(page.read_data(100, 3), &[0xAA, 0xAA, 0xAA]);
-        assert_eq!(PageHeader::read_page_lsn(&mut page), 50);
+        assert_eq!(PageHeader::read_page_lsn(&page), 50);
     }
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::recovery::log_record::LogRecord;
 
-        #[test]
-        fn test_analysis_winners_and_losers() {  }        // ← 只留这一份
+    #[test]
+    fn test_end_to_end_crash_recovery() {
+        use std::fs::{self, OpenOptions};
+        use crate::storage::disk_manager::DiskManager;
 
+        let db_path = "./data/test_restore.db";
+        let log_path = "./data/test_restore.log";
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(log_path);
+        fs::create_dir_all("./data").unwrap();
 
-
-        #[test]
-        fn test_apply_update_writes_after_image() {
-            use crate::recovery::lsn::INVALID_LSN;
-            let mut page = Page::new(42);
-            page.write_data(100, &[0xAA, 0xAA, 0xAA]);
-            PageHeader::write_page_lsn(&mut page, INVALID_LSN);
-            apply_update_to_page(&mut page, 100, 42, 100, &[0x11, 0x22, 0x33]);
-            assert_eq!(page.read_data(100, 3), &[0x11, 0x22, 0x33]);
-            assert_eq!(PageHeader::read_page_lsn(&page), 100);
-        }
-
-        #[test]
-        fn test_apply_update_is_idempotent() {
-            let mut page = Page::new(42);
-            PageHeader::write_page_lsn(&mut page, 200);
-            let snapshot = page.read_data(100, 3).to_vec();
-            apply_update_to_page(&mut page, 100, 42, 100, &[0x99, 0x99, 0x99]);
-            assert_eq!(page.read_data(100, 3), &snapshot[..]);
-            assert_eq!(PageHeader::read_page_lsn(&page), 200);
-        }
-        #[test]
-        fn test_end_to_end_crash_recovery() {
-            use std::fs::{self, OpenOptions};
-            use crate::storage::disk_manager::DiskManager;
-            use crate::config::PAGE_SIZE;
-            use crate::recovery::log_manager::LogManager;
-            use crate::recovery::log_record::LogRecord;
-            use crate::recovery::lsn::INVALID_LSN;
-
-            let db_path = "./data/test_restore.db";
-            let log_path = "./data/test_restore.log";
-            let _ = fs::remove_file(db_path);
-            let _ = fs::remove_file(log_path);
-            fs::create_dir_all("./data").unwrap();
-
-            // ===== 步骤 1：写入初始页到磁盘 =====
-            {
-                let file = OpenOptions::new().read(true).write(true).create(true)
-                    .open(db_path).unwrap();
-                let mut dm = DiskManager::from_file(file);
-                let mut page = Page::new(5);
-                page.write_data(100, &[0xAA; 10]);
-                dm.write_page(5, &page.data).unwrap();
-            }
-
-            // ===== 步骤 2-3：写日志（赢家 + 输家）=====
-            {
-                let lm = LogManager::from_path(log_path).unwrap();
-                // 赢家 txn=1
-                let l1 = lm.append(&LogRecord::Begin { txn_id: 1 });
-                let l2 = lm.append(&LogRecord::Update {
-                    txn_id: 1, prev_lsn: l1, page_id: 5, offset: 100,
-                    before: vec![0xAA; 10], after: vec![0x11; 10],
-                });
-                let l3 = lm.append(&LogRecord::Commit { txn_id: 1 });
-                lm.flush_to(l3).unwrap();  // commit 必须刷
-
-                // 输家 txn=2（只有 Begin + Update，没有 Commit）
-                let l4 = lm.append(&LogRecord::Begin { txn_id: 2 });
-                let _l5 = lm.append(&LogRecord::Update {
-                    txn_id: 2, prev_lsn: l4, page_id: 5, offset: 110,
-                    before: vec![0x00; 10], after: vec![0x22; 10],
-                });
-                lm.flush_to(l4).unwrap();  // 模拟"日志部分落盘"（只刷到 Begin）
-            }
-
-            // ===== 步骤 4：崩溃 = 什么都不做（上面 block 结束，所有对象 drop）=====
-            // page 5 在磁盘上仍然是步骤 1 的状态（offset 100 = [0xAA;10]，其余零）
-
-            // ===== 步骤 5：重开 =====
+        // 步骤 1：写入初始页到磁盘
+        {
             let file = OpenOptions::new().read(true).write(true).create(true)
                 .open(db_path).unwrap();
-            let dm = DiskManager::from_file(file);
-            let lm = LogManager::from_path(log_path).unwrap();
-            let lm = std::sync::Arc::new(lm);
-            let bp = std::sync::Arc::new(BufferPool::new(dm, std::sync::Arc::clone(&lm)));
-
-            // ===== 步骤 6：restore =====
-            restore(log_path, &bp, &lm).unwrap();
-
-            // ===== 步骤 7：验证 =====
-            let page_ref = bp.fetch_page(5).unwrap();
-            let page = page_ref.read().unwrap();
-
-            assert_eq!(page.read_data(100, 10), &[0x11; 10][..],
-                       "赢家数据应存活");
-
-            // 输家：redo 写了 [0x22;10]，但 undo 把 before [0x00;10] 盖回去了
-            assert_eq!(page.read_data(110, 10), &[0x00; 10][..],
-                       "输家数据应被撤销");
-
-            // 清理
-            drop(page);
-            drop(page_ref);
-            let _ = fs::remove_file(db_path);
-            let _ = fs::remove_file(log_path);
+            let mut dm = DiskManager::from_file(file);
+            let mut page = Page::new(5);
+            page.write_data(100, &[0xAA; 10]);
+            dm.write_page(5, &page.data).unwrap();
         }
+
+        // 步骤 2-3：写日志（赢家 + 输家）
+        {
+            let lm = LogManager::from_path(log_path).unwrap();
+            let l1 = lm.append(&LogRecord::Begin { txn_id: 1 });
+            let _l2 = lm.append(&LogRecord::Update {
+                txn_id: 1, prev_lsn: l1, page_id: 5, offset: 100,
+                before: vec![0xAA; 10], after: vec![0x11; 10],
+            });
+            let l3 = lm.append(&LogRecord::Commit { txn_id: 1 });
+            lm.flush_to(l3).unwrap();
+
+            let l4 = lm.append(&LogRecord::Begin { txn_id: 2 });
+            let l5 = lm.append(&LogRecord::Update {
+                txn_id: 2, prev_lsn: l4, page_id: 5, offset: 110,
+                before: vec![0x00; 10], after: vec![0x22; 10],
+            });
+            lm.flush_to(l5).unwrap();
+        }
+
+        // 步骤 4：崩溃（drop 一切，不刷页）
+
+        // 步骤 5：重开
+        let file = OpenOptions::new().read(true).write(true).create(true)
+            .open(db_path).unwrap();
+        let dm = DiskManager::from_file(file);
+        let lm = Arc::new(LogManager::from_path(log_path).unwrap());
+        let bp = Arc::new(BufferPool::new(dm, Arc::clone(&lm)));
+
+        // 步骤 6：restore
+        restore(log_path, &bp, &lm).unwrap();
+
+        // 步骤 7：验证
+        let page_ref = bp.fetch_page(5).unwrap();
+        let page = page_ref.read().unwrap();
+        assert_eq!(page.read_data(100, 10), &[0x11; 10][..], "赢家数据应存活");
+        assert_eq!(page.read_data(110, 10), &[0x00; 10][..], "输家数据应被撤销");
+
+        drop(page);
+        drop(page_ref);
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(log_path);
     }
 }

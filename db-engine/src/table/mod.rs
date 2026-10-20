@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::recovery::transaction::TransactionManager;
 use std::sync::Mutex;
 use crate::record::Record;
-use crate::row::{Row, RowBuilder, MAX_VARCHAR_LEN};
+use crate::row::{Row, RowBuilder};
 
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::free_page_manager::FreePageManager;
@@ -378,6 +378,7 @@ impl<'a> TypedRowBuilder<'a> {
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
+    #[allow(dead_code)]
     first_data_page: PageId,
     page_count: u32,
     record_count: u32,

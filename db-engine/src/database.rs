@@ -15,7 +15,6 @@ use crate::storage::disk_manager::DiskManager;
 use crate::storage::file_header::{FileHeader};
 use crate::storage::free_page_manager::FreePageManager;
 use crate::table::{Column, Table};
-use crate::types::PageId;
 
 /// FreePageManager 位图管理的最大页数
 const MAX_PAGES: u32 = 1024;
