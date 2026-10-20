@@ -90,7 +90,7 @@ impl Database {
         // Page 1: 恢复 FreePageManager
         let mut free_mgr = FreePageManager::new(PAGE_SIZE as u64, MAX_PAGES);
         free_mgr.load(&buffer_pool)?;
-
+        crate::recovery::restore::restore(&crate::config::LOG_FILE, &buffer_pool, &log_manager)?;
         // Page 2+: 恢复 Catalog
         let catalog = Catalog::load(buffer_pool.clone())?;
 
