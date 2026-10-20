@@ -9,8 +9,9 @@ import java.util.Properties;
 
 public class UpdateChecker {
 
-    // 当前程序版本：以后每次发版只改这一行
-    public static final String CURRENT_VERSION = "1.0.0";
+    // 当前程序版本：从自身 jar 的 MANIFEST 里读（由 pom 的 version 决定）
+    // 读不到时为 null，表示"开发态，版本未知"，此时跳过更新检查
+    public static final String CURRENT_VERSION = readVersionFromManifest();
 
     private static final String SERVER_URL = "http://127.0.0.1:8000/version.txt";
 
@@ -21,7 +22,21 @@ public class UpdateChecker {
     // 现在正在运行的程序文件（真实部署时如果 jar 位置变了，只改这一行）
     private static final Path CURRENT_JAR = Path.of("target", "dbms-client.jar");
 
+    // 从 MANIFEST 读取版本号；IDEA 直接运行时读不到，返回 null
+    private static String readVersionFromManifest() {
+        try {
+            Package pkg = UpdateChecker.class.getPackage();
+            String v = pkg == null ? null : pkg.getImplementationVersion();
+            return (v == null || v.isBlank()) ? null : v.trim();
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
     public static boolean isNewer(String remote, String current) {
+        if (remote == null || current == null) {
+            return false;       // 版本未知时不判定"有更新"，避免误下载
+        }
         String[] a = remote.split("\\.");
         String[] b = current.split("\\.");
         int n = Math.min(a.length, b.length);
@@ -88,14 +103,20 @@ public class UpdateChecker {
     }
 
     public static void main(String[] args) throws Exception {
-        System.out.println("当前版本: " + CURRENT_VERSION);
+        System.out.println("当前版本: " + (CURRENT_VERSION == null ? "(未知，开发态)" : CURRENT_VERSION));
 
         // 1. 先安装上次下载的更新（如果有）
         if (applyPendingUpdate()) {
             System.out.println("已安装上次下载的新版本");
         }
 
-        // 2. 检查服务器
+        // 2. 版本未知则跳过检查
+        if (CURRENT_VERSION == null) {
+            System.out.println("版本未知（IDEA 直接运行），跳过检查");
+            return;
+        }
+
+        // 3. 检查服务器
         Info info = fetchLatest();
         if (info == null) {
             System.out.println("连不上更新服务器，跳过检查（不影响启动）");
