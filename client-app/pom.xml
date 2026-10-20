@@ -85,7 +85,14 @@
               <transformers>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                   <mainClass>com.dbms.client.App</mainClass>
+                  <!-- 把本文件的 <version> 写进 jar 清单（META-INF/MANIFEST.MF），
+                       程序运行时用 UpdateChecker 读出来当"当前版本号"。
+                       以后发版只改第 9 行的 <version>，Java 代码一个字都不用动。 -->
+                  <manifestEntries>
+                    <Implementation-Version>${project.version}</Implementation-Version>
+                  </manifestEntries>
                 </transformer>
+
               </transformers>
             </configuration>
           </execution>

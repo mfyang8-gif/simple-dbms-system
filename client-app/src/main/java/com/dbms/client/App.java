@@ -29,6 +29,9 @@ public class App {
     /** 后台检查更新：连不上服务器、下载失败都静默跳过，不影响正常使用。 */
     private static void startUpdateCheck() {
         Thread t = new Thread(() -> {
+            if (UpdateChecker.CURRENT_VERSION == null) {
+                return;                                   // 开发态读不到 jar 清单，跳过检查
+            }
             UpdateChecker.Info info = UpdateChecker.fetchLatest();
             if (info == null || info.version == null || info.url == null) {
                 return;                                   // 没有更新服务器 / 连不上
