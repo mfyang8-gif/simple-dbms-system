@@ -21,6 +21,9 @@ pub const DB_DIR: &str = "./data";
 /// 主数据文件
 pub const DB_FILE: &str = "./data/db.db";
 
+
+/// WAL 预写日志文件（独立于数据文件，append-only）
+pub const LOG_FILE: &str = "./data/db.log";
 // ========== 网络配置 ==========
 
 /// 服务监听地址
@@ -35,13 +38,7 @@ pub const LISTEN_ADDR: &str = "127.0.0.1:5432";
 pub const MAX_RECORD_SIZE: usize = 512;
 
 /// 每页数据页的页头大小：4 字节（slot_count: u16 + occupied_count: u16）
-pub const PAGE_HEADER_SIZE: usize = 4;
 
-/// 每页可容纳的记录槽位数：(4096 - 4) / 512 = 7
-pub const SLOTS_PER_PAGE: usize = (PAGE_SIZE - PAGE_HEADER_SIZE) / MAX_RECORD_SIZE;
-
-/// 位图所需字节数：7 个槽位需要 7 bit → 向上取整 = 1 字节
-pub const BITMAP_BYTES_PER_PAGE: usize = (SLOTS_PER_PAGE + 7) / 8;
 
 /// 文件头固定大小（字节数）- 40 字节
 pub const FILE_HEADER_SIZE: usize = 40;

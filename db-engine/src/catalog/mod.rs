@@ -6,12 +6,12 @@
 //
 // 【磁盘布局 — 多页链表结构】
 // Page 2: Catalog Head Page
-//   [PageHeader: 4B] [u32 magic=0x4341544C] [u32 version=1]
+//   [PageHeader: 16B] [u32 magic=0x4341544C] [u32 version=1]
 //   [u32 table_count_on_page] [u32 next_catalog_page_id]
 //   [TableEntry1][TableEntry2]...
 //
 // Page N: Catalog Extension Page（可选，链表后续节点）
-//   [PageHeader: 4B] [u32 magic=0x4341544C] [u32 version=1]
+//   [PageHeader: 16B] [u32 magic=0x4341544C] [u32 version=1]
 //   [u32 table_count_on_page] [u32 next_catalog_page_id]
 //   [TableEntryN][TableEntryN+1]...
 //
@@ -172,6 +172,14 @@ impl Catalog {
     /// 每个 Catalog 页可用于 TableEntry 的最大字节数
     fn max_entries_bytes_per_page() -> usize {
         PAGE_SIZE - PAGE_HEADER_SIZE - CATALOG_PAGE_HEADER_SIZE
+    }
+
+    /// 从元数据构建 Table 对象（重启恢复时使用）
+    pub fn open_table(&self, name: &str) -> std::io::Result<Table> {
+        let meta = self.tables.get(name).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("Table '{}' not found", name))
+        })?;
+        Table::from_meta(meta, self.buffer_pool.clone())
     }
 
     /// 将一个 Catalog 页的内容写入 BufferPool
@@ -345,7 +353,7 @@ impl Catalog {
         })?;
         free_mgr.mark_used(first_data_page);
 
-        // 创建 Table（自动初始化页头 + 位图）
+        // 创建 Table（自动初始化 Slotted Page 页头）
         let table = Table::new(name.clone(), columns.clone(), first_data_page, self.buffer_pool.clone())?;
 
         // 记录元数据
@@ -404,12 +412,24 @@ impl Catalog {
         }
         Ok(())
     }
+
+    /// 同步表的列定义到 Catalog 并持久化（ALTER 操作后调用）
+    pub fn update_columns(&mut self, table_name: &str, columns: &[Column], free_mgr: &mut FreePageManager) -> std::io::Result<()> {
+        let meta = self.tables.get_mut(table_name).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("Table '{}' not found", table_name))
+        })?;
+        meta.columns = columns.to_vec();
+        self.dirty = true;
+        self.flush(free_mgr)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::disk_manager::DiskManager;
+    use crate::recovery::log_manager::LogManager;
 
     fn setup() -> (Arc<BufferPool>, FreePageManager) {
         let test_file = "./data/test_catalog.db";
@@ -424,7 +444,10 @@ mod tests {
             .unwrap();
 
         let dm = DiskManager::from_file(file);
-        let bp = Arc::new(BufferPool::new(dm));
+        let test_log = "./data/test_catalog.log";
+        let _ = std::fs::remove_file(test_log);
+        let lm = Arc::new(LogManager::from_path(test_log).unwrap());
+        let bp = Arc::new(BufferPool::new(dm, lm));
 
         // 预分配足够的页（支持多页 Catalog 扩展）
         for pid in 0..100u32 {
@@ -433,7 +456,6 @@ mod tests {
 
         let mut fpm = FreePageManager::new(crate::config::PAGE_SIZE as u64, 1024);
         fpm.mark_used(0); // FileHeader
-        // 注意：不再预先 mark_used(2)，由 flush() 负责标记
 
         (bp, fpm)
     }

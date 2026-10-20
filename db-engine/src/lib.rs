@@ -5,3 +5,5 @@ pub mod record;
 pub mod table;
 pub mod row;
 pub mod catalog;
+pub mod database;
+pub mod recovery;

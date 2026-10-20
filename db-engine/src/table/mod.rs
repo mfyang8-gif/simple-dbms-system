@@ -1,14 +1,19 @@
 use std::sync::Arc;
 use std::collections::HashMap;
-
+use crate::recovery::transaction::TransactionManager;
+use std::sync::Mutex;
 use crate::record::Record;
 use crate::row::{Row, RowBuilder, MAX_VARCHAR_LEN};
-use crate::storage::bitmap::Bitmap;
+
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::free_page_manager::FreePageManager;
 use crate::storage::page_header::PageHeader;
 use crate::storage::page_ops;
 use crate::types::{PageId, RowId};
+
+// ★ [Slice B 修改] 新增：自动提交事务 id。
+//   Slice B 暂无事务管理器，每条语句用固定 id；Phase 3 会替换为真实 txn_id。
+
 
 // ==================== 列类型与约束定义 ====================
 
@@ -211,7 +216,7 @@ impl Column {
             let col_len = u16::from_le_bytes(data[*offset..*offset + 2].try_into().unwrap()) as usize; *offset += 2;
             if *offset + col_len > data.len() { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "fk col")); }
             let column = std::str::from_utf8(&data[*offset..*offset + col_len])
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("fk col: {}", e)))?.to_string();
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("fk column: {}", e)))?.to_string();
             *offset += col_len;
             Some((table, column))
         };
@@ -235,6 +240,7 @@ impl Column {
     }
 }
 
+// ... existing code ...
 // ==================== CHECK 约束解析与求值 ====================
 
 #[derive(Debug, Clone)]
@@ -379,6 +385,8 @@ pub struct Table {
     data_pages: Vec<PageId>,
     /// AUTO_INCREMENT 的下一个分配值 (列名 -> next_id)
     auto_increment_next: HashMap<String, u32>,
+    /// 建表时一次性解析，列名 → 解析后的条件列表
+    check_cache: HashMap<String, Vec<CheckCondition>>,
 }
 
 impl Table {
@@ -387,45 +395,183 @@ impl Table {
         {
             let mut page = page_ref.write().unwrap();
             PageHeader::new().write_to_page(&mut page);
-            page.write_data(crate::config::PAGE_HEADER_SIZE, Bitmap::new().to_bytes());
         }
 
         let mut auto_increment_next = HashMap::new();
+        let mut check_cache = HashMap::new();
         for col in &columns {
             if col.auto_increment {
                 auto_increment_next.insert(col.name.clone(), 1);
+            }
+            if let Some(ref condition) = col.check {
+                let parsed = CheckCondition::parse(condition)?;
+                check_cache.insert(col.name.clone(), vec![parsed]);
             }
         }
 
         Ok(Self {
             name, columns, first_data_page, page_count: 1, record_count: 0,
             buffer_pool, data_pages: vec![first_data_page],
-            auto_increment_next,
+            auto_increment_next, check_cache,
         })
     }
+
+    pub fn from_meta(meta: &crate::catalog::TableMeta, buffer_pool: Arc<BufferPool>) -> std::io::Result<Self> {
+        let mut auto_increment_next = HashMap::new();
+        let mut check_cache = HashMap::new();
+        for col in &meta.columns {
+            if col.auto_increment {
+                auto_increment_next.insert(col.name.clone(), meta.record_count + 1);
+            }
+            if let Some(ref condition) = col.check {
+                let parsed = CheckCondition::parse(condition)?;
+                check_cache.insert(col.name.clone(), vec![parsed]);
+            }
+        }
+
+        Ok(Self {
+            name: meta.name.clone(),
+            columns: meta.columns.clone(),
+            first_data_page: meta.first_data_page,
+            page_count: meta.page_count,
+            record_count: meta.record_count,
+            buffer_pool,
+            data_pages: meta.data_pages.clone(),
+            auto_increment_next,
+            check_cache,
+        })
+    }
+
+    pub fn alter_check_constraint(&mut self, column_name: &str, new_condition: Option<&str>) -> std::io::Result<()> {
+        let col = self.columns.iter_mut()
+            .find(|c| c.name == column_name)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Column '{}' not found", column_name),
+            ))?;
+
+        match new_condition {
+            Some(condition) => {
+                let parsed = CheckCondition::parse(condition)?;
+                col.check = Some(condition.to_string());
+                self.check_cache.insert(column_name.to_string(), vec![parsed]);
+            }
+            None => {
+                col.check = None;
+                self.check_cache.remove(column_name);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn alter_default(&mut self, column_name: &str, new_default: Option<DefaultVal>) -> std::io::Result<()> {
+        let col = self.columns.iter_mut()
+            .find(|c| c.name == column_name)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Column '{}' not found", column_name),
+            ))?;
+        col.default_value = new_default;
+        Ok(())
+    }
+
+    pub fn alter_nullable(&mut self, column_name: &str, nullable: bool) -> std::io::Result<()> {
+        let col = self.columns.iter_mut()
+            .find(|c| c.name == column_name)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Column '{}' not found", column_name),
+            ))?;
+        col.nullable = nullable;
+        Ok(())
+    }
+
+    pub fn rename_column(&mut self, old_name: &str, new_name: &str) -> std::io::Result<()> {
+        if old_name == new_name { return Ok(()); }
+
+        if self.columns.iter().any(|c| c.name == new_name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("Column '{}' already exists", new_name),
+            ));
+        }
+
+        let col = self.columns.iter_mut()
+            .find(|c| c.name == old_name)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Column '{}' not found", old_name),
+            ))?;
+        col.name = new_name.to_string();
+
+        if let Some(conditions) = self.check_cache.remove(old_name) {
+            self.check_cache.insert(new_name.to_string(), conditions);
+        }
+
+        if let Some(next_id) = self.auto_increment_next.remove(old_name) {
+            self.auto_increment_next.insert(new_name.to_string(), next_id);
+        }
+
+        Ok(())
+    }
+
+    pub fn add_column(&mut self, column: Column) -> std::io::Result<()> {
+        if self.columns.iter().any(|c| c.name == column.name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("Column '{}' already exists", column.name),
+            ));
+        }
+
+        if let Some(ref condition) = column.check {
+            let parsed = CheckCondition::parse(condition)?;
+            self.check_cache.insert(column.name.clone(), vec![parsed]);
+        }
+        if column.auto_increment {
+            self.auto_increment_next.insert(column.name.clone(), 1);
+        }
+
+        self.columns.push(column);
+        Ok(())
+    }
+
+    pub fn drop_column(&mut self, column_name: &str) -> std::io::Result<()> {
+        let pos = self.columns.iter()
+            .position(|c| c.name == column_name)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Column '{}' not found", column_name),
+            ))?;
+
+        if self.columns.len() == 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Cannot drop the last column",
+            ));
+        }
+
+        self.columns.remove(pos);
+        self.check_cache.remove(column_name);
+        self.auto_increment_next.remove(column_name);
+        Ok(())
+    }
+
+    pub fn columns(&self) -> &[Column] { &self.columns }
 
     pub fn new_row(&self) -> TypedRowBuilder<'_> { TypedRowBuilder::new(&self.columns) }
 
     /// 高层插入接口：带有完整的约束校验与自增填充
-    pub fn insert_row(&mut self, row: Row, free_mgr: &mut FreePageManager, catalog: &mut crate::catalog::Catalog) -> std::io::Result<RowId> {
-        // 1. 拦截并处理 AUTO_INCREMENT
+    pub fn insert_row(&mut self, row: Row, free_mgr: &mut FreePageManager, catalog: &mut crate::catalog::Catalog, txn_mgr: &Arc<Mutex<TransactionManager>>) -> std::io::Result<RowId> {
         let filled_row = self.fill_auto_increment(row)?;
-
-        // 2. 校验 UNIQUE / PRIMARY KEY
         self.check_unique_constraints(&filled_row)?;
-
-        // 3. 校验 CHECK 约束
         self.evaluate_check_constraints(&filled_row)?;
-
-        // 4. 真正落盘写入数据
         let record = filled_row.to_record()?;
-        self.insert_raw(&record, free_mgr, catalog)
+
+        self.insert_raw(&record, free_mgr, catalog, txn_mgr)
     }
 
-    /// 填充 AUTO_INCREMENT 的逻辑
-    /// 采用“解析旧 Row -> 替换特定字段 -> 组装新 Row”的策略
     fn fill_auto_increment(&mut self, row: Row) -> std::io::Result<Row> {
-        // 找出哪些列是自增列
         let auto_cols: Vec<usize> = self.columns.iter().enumerate()
             .filter(|(_, c)| c.auto_increment).map(|(i, _)| i).collect();
 
@@ -436,18 +582,15 @@ impl Table {
 
         for (i, col) in self.columns.iter().enumerate() {
             if auto_cols.contains(&i) {
-                // 读取用户填的 dummy 占位值（如 0）并抛弃
                 match &col.col_type {
                     ColumnType::Int => { cursor.get_int()?; }
                     ColumnType::Varchar(_) => { cursor.get_varchar()?; }
                 }
 
-                // 从内存状态中取出真正的 next_id 并写入，然后自增 1
                 let next_id = self.auto_increment_next.entry(col.name.clone()).or_insert(1);
                 builder = builder.put_int(*next_id);
                 *next_id += 1;
             } else {
-                // 如果不是自增列，把老 row 里的数据原封不动读出来，塞进新 row
                 match &col.col_type {
                     ColumnType::Int => { builder = builder.put_int(cursor.get_int()?); }
                     ColumnType::Varchar(_) => { builder = builder.put_varchar(cursor.get_varchar()?)?; }
@@ -455,18 +598,20 @@ impl Table {
             }
         }
 
-        // 返回重组后的 Row
         Ok(builder.build())
     }
 
     fn evaluate_check_constraints(&self, row: &Row) -> std::io::Result<()> {
-        for col in &self.columns {
-            if let Some(ref condition) = col.check {
-                let parsed = CheckCondition::parse(condition)?;
-                if !parsed.evaluate(row, &self.columns)? {
+        for (col_name, conditions) in &self.check_cache {
+            for condition in conditions {
+                if !condition.evaluate(row, &self.columns)? {
+                    let raw = self.columns.iter()
+                        .find(|c| &c.name == col_name)
+                        .and_then(|c| c.check.as_deref())
+                        .unwrap_or("unknown");
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("CHECK constraint violated for column '{}': {}", col.name, condition),
+                        format!("CHECK constraint violated for column '{}': {}", col_name, raw),
                     ));
                 }
             }
@@ -518,12 +663,17 @@ impl Table {
     }
 
     /// 纯底层插入，绕过所有校验逻辑（内部使用）
-    /// 纯底层插入，绕过所有校验逻辑（内部使用）
-    pub fn insert_raw(&mut self, record: &Record, free_mgr: &mut FreePageManager, catalog: &mut crate::catalog::Catalog) -> std::io::Result<RowId> {
+    pub fn insert_raw(&mut self, record: &Record, free_mgr: &mut FreePageManager, catalog: &mut crate::catalog::Catalog, txn_mgr: &Arc<Mutex<TransactionManager>>) -> std::io::Result<RowId> {
+        // ① 向共享 TM 开事务：拿 (id, begin_lsn) 的瞬间即放锁（绝不持锁做 IO）
+        let (txn_id, begin_lsn) = { txn_mgr.lock().unwrap().begin() };
+        // ② 用 TM 发好的号起“本条语句的 Update 游标”，不再自造 txn_id
+        let mut wal = page_ops::WalContext::with_txn(self.buffer_pool.log_manager().clone(), txn_id, begin_lsn);
+
         let last_page = *self.data_pages.last().unwrap();
         let page_ref = self.buffer_pool.fetch_page(last_page)?;
-        if let Some(slot) = page_ops::insert_record(&mut page_ref.write().unwrap(), record) {
+        if let Some(slot) = page_ops::insert_record(&mut page_ref.write().unwrap(), record, &mut wal) {
             self.record_count += 1;
+            txn_mgr.lock().unwrap().commit(txn_id);
             return Ok(RowId::new(last_page, slot));
         }
 
@@ -535,24 +685,18 @@ impl Table {
         {
             let mut page = new_page_ref.write().unwrap();
             PageHeader::new().write_to_page(&mut page);
-            page.write_data(crate::config::PAGE_HEADER_SIZE, Bitmap::new().to_bytes());
-            if let Some(slot) = page_ops::insert_record(&mut page, record) {
+            if let Some(slot) = page_ops::insert_record(&mut page, record, &mut wal) {
                 self.record_count += 1;
                 self.page_count += 1;
                 self.data_pages.push(new_page_id);
-
-                // 同步更新 Catalog 中的 TableMeta
-                catalog.update_table_meta(
-                    &self.name,
-                    self.page_count,
-                    self.record_count,
-                    self.data_pages.clone(),
-                    free_mgr,
-                )?;
-
+                catalog.update_table_meta(&self.name, self.page_count, self.record_count, self.data_pages.clone(), free_mgr)?;
+                txn_mgr.lock().unwrap().commit(txn_id);
                 return Ok(RowId::new(new_page_id, slot));
             }
         }
+
+        // ③ 两次都插失败：声明该事务作废（写 Abort + 从 active 摘除）
+        txn_mgr.lock().unwrap().abort(txn_id);
         Err(std::io::Error::new(std::io::ErrorKind::Other, "Insert failed"))
     }
 
@@ -560,10 +704,26 @@ impl Table {
         page_ops::read_record(&self.buffer_pool.fetch_page(row_id.page_id)?.read().unwrap(), row_id.slot_id)
     }
 
-    pub fn delete(&mut self, row_id: RowId) -> std::io::Result<()> {
-        page_ops::delete_record(&mut self.buffer_pool.fetch_page(row_id.page_id)?.write().unwrap(), row_id.slot_id)?;
-        self.record_count -= 1;
-        Ok(())
+    pub fn delete(&mut self, row_id: RowId, txn_mgr: &Arc<Mutex<TransactionManager>>) -> std::io::Result<()> {
+        let (txn_id, begin_lsn) = { txn_mgr.lock().unwrap().begin() };
+        let mut wal = page_ops::WalContext::with_txn(self.buffer_pool.log_manager().clone(), txn_id, begin_lsn);
+
+        let result = page_ops::delete_record(
+            &mut self.buffer_pool.fetch_page(row_id.page_id)?.write().unwrap(),
+            row_id.slot_id,
+            &mut wal,
+        );
+        match result {
+            Ok(()) => {
+                self.record_count -= 1;
+                txn_mgr.lock().unwrap().commit(txn_id);
+                Ok(())
+            }
+            Err(e) => {
+                txn_mgr.lock().unwrap().abort(txn_id);
+                Err(e)
+            }
+        }
     }
 
     pub fn scan_all(&self) -> std::io::Result<Vec<(RowId, Record)>> {

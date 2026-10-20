@@ -20,6 +20,8 @@ pub struct FreePageManager {
     max_pages: u32,
     /// 位图在文件中的起始偏移量（位于 Page 0 内 FileHeader 之后）
     bitmap_offset: u64,
+    
+    
 }
 
 impl FreePageManager {
@@ -33,6 +35,10 @@ impl FreePageManager {
         }
     }
 
+
+    pub fn total_pages(&self) -> u32 {
+        self.max_pages
+    }
     /// 从 BufferPool 加载位图到内存
     ///
     /// 通过 BufferPool 获取位图所在的页，从中拷贝位图数据。

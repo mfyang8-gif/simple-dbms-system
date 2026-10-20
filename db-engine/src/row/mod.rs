@@ -233,7 +233,7 @@ impl std::fmt::Display for Row { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) 
         // INT 4 字节，cursor 把它当 VARCHAR 读：第一字节是 0x01（长度=1）
         // 但后面只剩 3 字节，其中取 1 字节做 UTF-8 是合法的
         let s = cursor.get_varchar().unwrap();
-        assert_eq!(s, "\x01"); // 0x01 作为 u8 长度 = 1，然后读取 1 字节 0x00
+        assert_eq!(s, "\x00"); // 0x01 作为 u8 长度 = 1，然后读取 1 字节 0x00
     }
 
     #[test]
