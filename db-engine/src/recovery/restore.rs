@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 use crate::recovery::log_manager::LogManager;
 use crate::recovery::log_record::{LogRecord, TxnId};
-use crate::recovery::lsn::{Lsn};
+use crate::recovery::lsn::{Lsn, INVALID_LSN};
 
+use std::sync::Arc;
+use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page::Page;
 use crate::storage::page_header::PageHeader;
 use crate::types::PageId;
@@ -17,7 +19,23 @@ pub struct TxnStats {
 
 /// Analysis 的输出：一张事务表
 pub type TxnTable = HashMap<TxnId, TxnStats>;
+pub fn restore(
+    log_path: &str,
+    buffer_pool: &Arc<BufferPool>,
+    log: &Arc<LogManager>,
+) -> std::io::Result<()> {
+    // ① Analysis：读日志 → 建 TxnTable
+    let records = LogManager::read_all(log_path)?;
+    let txn_table = analyze(&records);
 
+    // ② Redo：把所有 Update.after 无差别重放到页上
+    redo(&records, buffer_pool)?;
+
+    // ③ Undo：沿输家链回滚，写 CLR + 把 before 写回页
+    undo(&txn_table, &records, buffer_pool, log)?;
+
+    Ok(())
+}
 /// 纯函数：把日志记录序列 → 事务表（方便单测直接喂 Vec，不碰文件）
 pub fn analyze(records: &[(Lsn, LogRecord)]) -> TxnTable {
     let mut table: TxnTable = HashMap::new();
@@ -37,15 +55,104 @@ pub fn analyze(records: &[(Lsn, LogRecord)]) -> TxnTable {
                 table.get_mut(txn_id).map(|stats| { stats.last_lsn = *lsn; });
             }
 
-            // TODO 你来写 4 个分支：Begin / Commit / Abort / Update
-            //   Begin { txn_id }        → table.insert(*txn_id, TxnStats { is_winner: false, last_lsn: *lsn })
-            //   Commit { txn_id }       → 拿到 entry，把 is_winner 改成 true，last_lsn 更新为 *lsn
-            //   Abort { txn_id }        → 更新 last_lsn（赢家保持 false）
-            //   Update { txn_id, .. }   → 只把 last_lsn 推进（不改胜负；用 if let Some 保护，因为可能这条记录属于 Begin 之前？其实不会）
+
             _ => {} // Checkpoint / CLR 等先忽略
         }
     }
     table
+}
+
+/// 把一条 Update 的 before_image 写回页（撤销该次修改）。
+/// 不做幂等检查（幂等由上层通过"是否已存在对应 CLR"来判断）。
+pub fn apply_undo_to_page(
+    page: &mut Page,
+    rec_lsn: Lsn,
+    _page_id: PageId,
+    offset: u16,
+    before: &[u8],
+) {
+
+    page.write_data(offset as usize, before);
+    //   ② PageHeader::write_page_lsn(page, rec_lsn);
+    PageHeader::write_page_lsn(page,rec_lsn);
+}
+pub fn apply_update_to_page(
+    page: &mut Page,
+    rec_lsn: Lsn,
+    _page_id: PageId,   // 保留形参方便上层日志诊断；这里没用到
+    offset: u16,
+    after: &[u8],
+) {
+
+    if PageHeader::read_page_lsn(page) >= rec_lsn { return; }
+
+    page.write_data(offset as usize, after);
+
+    PageHeader::write_page_lsn(page, rec_lsn);
+}
+/// Redo pass：遍历日志中所有 Update 记录，通过 buffer_pool 拿到对应页，
+/// 把 after_image 重放上去（幂等由 apply_update_to_page 内部保证）。
+pub fn redo(records: &[(Lsn, LogRecord)], buffer_pool: &Arc<BufferPool>) -> std::io::Result<()> {
+    for (lsn, rec) in records {
+
+        if let LogRecord::Update { page_id, offset, after, .. } = rec {
+            let page_ref = buffer_pool.fetch_page(*page_id)?;
+            let mut page = page_ref.write().unwrap();
+            apply_update_to_page(&mut page, *lsn, *page_id, *offset, after);
+        }
+
+    }
+    Ok(())
+}
+/// Undo pass：遍历 TxnTable 中所有输家，沿 prev_lsn 链回滚其 Update。
+/// 每撤一条：先写 CLR + flush（WAL 规则），再把 before 写回页。
+pub fn undo(
+    txn_table: &TxnTable,
+    records: &[(Lsn, LogRecord)],
+    buffer_pool: &Arc<BufferPool>,
+    log: &Arc<LogManager>,
+) -> std::io::Result<()> {
+    // ① 建索引：lsn -> &LogRecord（O(1) 跳转）
+    let by_lsn: HashMap<Lsn, &LogRecord> = records.iter().map(|(l, r)| (*l, r)).collect();
+
+    // ② 对每个输家事务
+    for (txn_id, stats) in txn_table {
+        if stats.is_winner { continue; }
+
+        let mut next_undo: Lsn = stats.last_lsn;
+
+        // ③ 沿链往回走
+        while next_undo != INVALID_LSN {
+            let rec = match by_lsn.get(&next_undo) {
+                Some(r) => *r,
+                None => break,
+            };
+            match rec {
+                LogRecord::Update { page_id, offset, before, prev_lsn, txn_id: rec_txn, .. } => {
+                    if rec_txn != txn_id { break; }
+                    let clr = LogRecord::Compensate {
+                        txn_id: *txn_id,
+                        prev_lsn: next_undo,
+                        page_id: *page_id,
+                        offset: *offset,
+                        before: before.clone(),
+                        undo_next_lsn: *prev_lsn,
+                    };
+                    let clr_lsn = log.append(&clr);
+                    log.flush_to(clr_lsn).expect("flush CLR failed");
+                    let page_ref = buffer_pool.fetch_page(*page_id)?;
+                    let mut page = page_ref.write().unwrap();
+                    apply_undo_to_page(&mut page, next_undo, *page_id, *offset, before);
+                    next_undo = *prev_lsn;
+                },
+                LogRecord::Begin { .. } => break,
+                _ => break,
+            }
+
+
+        }
+    }
+    Ok(())
 }
 
 /// 端到端入口：从日志文件路径读出记录 → 交给 analyze
@@ -75,50 +182,48 @@ mod tests {
         assert_eq!(t.get(&3), Some(&TxnStats { is_winner: false, last_lsn: 14 }));
     }
 
-    pub fn apply_update_to_page(
-        page: &mut Page,
-        rec_lsn: Lsn,
-        _page_id: PageId,   // 保留形参方便上层日志诊断；这里没用到
-        offset: u16,
-        after: &[u8],
-    ) {
-        // TODO 你来写 3 步：
-        //   ① 若 PageHeader::read_page_lsn(page) >= rec_lsn，直接 return（幂等跳过）
-        if PageHeader::read_page_lsn(page) >= rec_lsn { return; }
-
-        page.write_data(offset as usize, after);
-
-        PageHeader::write_page_lsn(page, rec_lsn);
-    }
-
-    fn test_apply_update_writes_after_image() {
-        use crate::recovery::lsn::INVALID_LSN;
-        let mut page = Page::new(42);
-        // 初始：offset 100 处是几个 0xAA 字节，page_lsn 未点亮
-        page.write_data(100, &[0xAA, 0xAA, 0xAA]);
-        PageHeader::write_page_lsn(&mut page, INVALID_LSN);
-
-        // 一条 Update：把这 3 字节改成 0x11 0x22 0x33，rec_lsn=100
-        apply_update_to_page(&mut page, 100, 42, 100, &[0x11, 0x22, 0x33]);
-
-        assert_eq!(&page.read_data(100, 3), &[0x11, 0x22, 0x33]);
-        assert_eq!(PageHeader::read_page_lsn(&page), 100);
-    }
-
     #[test]
-    fn test_apply_update_is_idempotent() {
-        // 已吸收过该 lsn（page_lsn >= rec_lsn）→ 不该重复写
+    fn test_apply_undo_writes_before_image() {
         let mut page = Page::new(42);
-        PageHeader::write_page_lsn(&mut page, 200);   // 页已经追到 200
-        let snapshot = page.read_data(100, 3).to_vec();
+        // 模拟 redo 之后的状态：页上已是 after = [0x11, 0x22, 0x33]
+        page.write_data(100, &[0x11, 0x22, 0x33]);
+        PageHeader::write_page_lsn(&mut page, 50);
 
-        apply_update_to_page(&mut page, 100, 42, 100, &[0x99, 0x99, 0x99]);   // 试图重放 lsn=100
+        // undo：把 before = [0xAA, 0xAA, 0xAA] 写回
+        apply_undo_to_page(&mut page, 50, 42, 100, &[0xAA, 0xAA, 0xAA]);
 
-        // 应该跳过：数据不变、page_lsn 也不变
-        assert_eq!(&page.read_data(100, 3), &snapshot[..]);
-
-        assert_eq!(PageHeader::read_page_lsn(&page), 200);
+        assert_eq!(page.read_data(100, 3), &[0xAA, 0xAA, 0xAA]);
+        assert_eq!(PageHeader::read_page_lsn(&mut page), 50);
     }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::recovery::log_record::LogRecord;
+
+        #[test]
+        fn test_analysis_winners_and_losers() {  }        // ← 只留这一份
 
 
+
+        #[test]
+        fn test_apply_update_writes_after_image() {
+            use crate::recovery::lsn::INVALID_LSN;
+            let mut page = Page::new(42);
+            page.write_data(100, &[0xAA, 0xAA, 0xAA]);
+            PageHeader::write_page_lsn(&mut page, INVALID_LSN);
+            apply_update_to_page(&mut page, 100, 42, 100, &[0x11, 0x22, 0x33]);
+            assert_eq!(page.read_data(100, 3), &[0x11, 0x22, 0x33]);
+            assert_eq!(PageHeader::read_page_lsn(&page), 100);
+        }
+
+        #[test]
+        fn test_apply_update_is_idempotent() {
+            let mut page = Page::new(42);
+            PageHeader::write_page_lsn(&mut page, 200);
+            let snapshot = page.read_data(100, 3).to_vec();
+            apply_update_to_page(&mut page, 100, 42, 100, &[0x99, 0x99, 0x99]);
+            assert_eq!(page.read_data(100, 3), &snapshot[..]);
+            assert_eq!(PageHeader::read_page_lsn(&page), 200);
+        }
+    }
 }
