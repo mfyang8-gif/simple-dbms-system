@@ -7,3 +7,4 @@ pub mod row;
 pub mod catalog;
 pub mod database;
 pub mod recovery;
+pub mod sql;
