@@ -271,7 +271,37 @@ fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<E
 
     Ok(ResultSet::Rows { columns: out_col_names, rows })
 }
-fn execute_delete(_t: String, _f: Option<Expr>, _db: &mut Database) -> Result<ResultSet, String> { todo!() }
+// 删除表中所有行
+fn execute_delete(t: String, f: Option<Expr>, db: &mut Database) -> Result<ResultSet, String> {
+    let mut table = db.open_table(&t)
+    .map_err(|e| format!("open_table failed: {}", e))?;
+    // 全列名（schema 顺序）
+    let all_col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    let out_rows = table.scan_all().map_err(|e| format!("scan_all failed: {}", e))?;
+    let mut row_ids = Vec::new();
+    for (row_id, record) in &out_rows {
+        let vals = decode_row(&table, record)?;
+        if let Some(f) = &f {
+            if !eval_expr(f, &all_col_names, &vals)? {
+                continue;
+            }
+
+        }
+        { row_ids.push(*row_id); }
+
+
+    }
+
+    let count = row_ids.len();      // ← 注意：要在 row_ids 被 for 循环消耗掉之前拿 len
+
+    for row_id in row_ids {
+        table.delete(row_id, db.txn_mgr())
+            .map_err(|e| format!("delete failed: {}", e))?;
+    }
+    Ok(ResultSet::Affected(count))
+
+
+}
 
 
 #[cfg(test)]
@@ -441,6 +471,34 @@ mod tests {
         let err = exec_sql(&mut db, &mut session, "SELECT ghost FROM p_emp").unwrap_err();
         assert!(err.contains("not found"), "got: {}", err);
 
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_delete() {
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE d_emp (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO d_emp VALUES (1, 20, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO d_emp VALUES (2, 17, 'Bob')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO d_emp VALUES (3, 25, 'Carter')").unwrap();
+
+        // 条件删除：age < 18 → 只删 Bob
+        let r = exec_sql(&mut db, &mut session, "DELETE FROM d_emp WHERE age < 18").unwrap();
+        assert!(matches!(r, ResultSet::Affected(1)), "got {:?}", r);
+
+        // 验证：剩 2 行且没有 Bob
+        let r = exec_sql(&mut db, &mut session, "SELECT name FROM d_emp").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert!(!rows.iter().any(|row| row[0] == "Bob"));
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
         let _ = db.shutdown();
     }
 }

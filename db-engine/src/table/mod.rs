@@ -716,7 +716,7 @@ impl Table {
         );
         match result {
             Ok(()) => {
-                self.record_count -= 1;
+                self.record_count = self.record_count.saturating_sub(1);
                 txn_mgr.lock().unwrap().commit(txn_id);
                 Ok(())
             }
