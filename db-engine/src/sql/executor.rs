@@ -5,7 +5,11 @@ use crate::database::Database;
 use crate::table::{Column, ColumnType};
 /// 执行结果：SELECT 返回行，其它语句返回受影响行数
 use crate::row::RowBuilder;
-   // 你之前只 import 了 Column，加个 ColumnType
+// 你之前只 import 了 Column，加个 ColumnType
+use crate::record::Record;
+use crate::row::Row;
+use crate::table::Table;
+use std::cmp::Ordering;
 #[derive(Debug)]
 pub enum ResultSet {
     Rows { columns: Vec<String>, rows: Vec<Vec<String>> },
@@ -27,7 +31,39 @@ fn ast_col_to_column(def: ColumnDef) -> Column {
     if def.not_null    { c = c.not_null(); }
     c
 }
+#[derive(Debug, Clone, PartialEq)]
+enum Value {
+    Int(i64),
+    Str(String),
+}
 
+impl Value {
+    fn to_string_readable(&self) -> String {
+        match self {
+            Value::Int(n) => n.to_string(),
+            Value::Str(s) => s.clone(),
+        }
+    }
+}
+
+/// 按 schema 把一行字节解析成 Vec<Value>
+fn decode_row(table: &Table, record: &Record) -> Result<Vec<Value>, String> {
+    let row = Row::from_record(record);
+    let mut cursor = row.cursor();
+    let mut vals = Vec::new();
+    for col in &table.columns {
+        let v = match &col.col_type {
+            ColumnType::Int => Value::Int(
+                cursor.get_int().map_err(|e| format!("decode col '{}': {}", col.name, e))? as i64,
+            ),
+            ColumnType::Varchar(_) => Value::Str(
+                cursor.get_varchar().map_err(|e| format!("decode col '{}': {}", col.name, e))?.to_string(),
+            ),
+        };
+        vals.push(v);
+    }
+    Ok(vals)
+}
 fn execute_create_table(name: String, columns: Vec<ColumnDef>, db: &mut Database) -> Result<ResultSet, String> {
     // 1. 把每个 ColumnDef 转成 Column
     let real_cols: Vec<Column> = columns.into_iter().map(ast_col_to_column).collect();
@@ -109,7 +145,132 @@ fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, d
     db.insert(&mut table, row).map_err(|e| format!("insert failed: {}", e))?;
     Ok(ResultSet::Affected(1))
 }
-fn execute_select(_c: Vec<SelectItem>, _t: String, _f: Option<Expr>, _db: &mut Database) -> Result<ResultSet, String> { todo!() }
+
+// 评估标量表达式（列名查表 → 下标 → 从当前行取值）
+fn eval_scalar(e: &Expr, col_names: &[String], vals: &[Value]) -> Result<Value, String> {
+    match e {
+        Expr::Column(name) => {
+            // 列名查表 → 下标 → 从当前行取值。查不到 = 列不存在（Q3 的第三道防线）
+            let idx = col_names.iter().position(|c| c == name)
+                .ok_or_else(|| format!("column '{}' not found", name))?;
+            Ok(vals[idx].clone())
+        }
+        Expr::Literal(LitValue::Number(n)) => Ok(Value::Int(*n)),
+        Expr::Literal(LitValue::Str(s)) => Ok(Value::Str(s.clone())),
+        other => Err(format!("unsupported scalar: {:?}", other)),
+    }
+}
+
+/// 比较两个值（类型必须一致：Int 和 Int 比、Str 和 Str 比）
+fn compare(l: &Value, op: &BinOp, r: &Value) -> Result<bool, String> {
+    let ord = match (l, r) {
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::Str(a), Value::Str(b)) => a.cmp(b),
+        _ => return Err(format!("cannot compare {:?} with {:?}", l, r)),
+    };
+    Ok(match op {
+        BinOp::Eq => ord == Ordering::Equal,
+        BinOp::Neq => ord != Ordering::Equal,
+        BinOp::Lt => ord == Ordering::Less,
+        BinOp::Le => ord != Ordering::Greater,
+        BinOp::Gt => ord == Ordering::Greater,
+        BinOp::Ge => ord != Ordering::Less,
+    })
+}
+
+/// LIKE 匹配（支持 % 通配符，双指针回溯法）
+fn like_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let (mut last_star_p, mut last_star_t) = (usize::MAX, 0usize);
+
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            ti += 1; pi += 1;                      // 字符相等，双双前进
+        } else if pi < p.len() && p[pi] == '%' {
+            last_star_p = pi; last_star_t = ti;    // 记住 % 的位置
+            pi += 1;                               // 先假设 % 匹配 0 个字符
+        } else if last_star_p != usize::MAX {
+            pi = last_star_p + 1;                  // 失败 → 回溯到 %
+            last_star_t += 1;                      // 让 % 多吃 1 个字符
+            ti = last_star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' { pi += 1; } // 末尾的 % 允许空匹配
+    pi == p.len()
+}
+
+/// 评估整个过滤表达式 → true/false（递归下降——和 Parser 的树一一对应）
+fn eval_expr(expr: &Expr, col_names: &[String], vals: &[Value]) -> Result<bool, String> {
+    match expr {
+        Expr::BinOp { left, op, right } => {
+            let l = eval_scalar(left, col_names, vals)?;
+            let r = eval_scalar(right, col_names, vals)?;
+            compare(&l, op, &r)
+        }
+        Expr::And(a, b) => Ok(eval_expr(a, col_names, vals)? && eval_expr(b, col_names, vals)?),
+        Expr::Or(a, b) => Ok(eval_expr(a, col_names, vals)? || eval_expr(b, col_names, vals)?),
+        Expr::Like { expr, pattern } => {
+            let v = eval_scalar(expr, col_names, vals)?;
+            Ok(like_match(&v.to_string_readable(), pattern))
+        }
+        other => Err(format!("unsupported filter expression: {:?}", other)),
+    }
+}
+fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<Expr>, db: &mut Database) -> Result<ResultSet, String> {
+    let table = db.open_table(&table_name)
+        .map_err(|e| format!("open_table failed: {}", e))?;
+
+    // 全列名（schema 顺序）
+    let all_col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+
+    // ★ 5.4-c：决定投影下标（"要输出哪几列"）
+    let proj: Vec<usize> = match &columns[..] {
+        [SelectItem::Star] => (0..all_col_names.len()).collect(),   // * → 全列
+        items => {
+            let mut idxs = Vec::new();
+            for item in items {
+                match item {
+                    SelectItem::Column(name) => {
+                        let i = all_col_names.iter().position(|c| c == name)
+                            .ok_or_else(|| format!("column '{}' not found", name))?;
+                        idxs.push(i);
+                    }
+                    other => return Err(format!("unsupported select item: {:?}", other)),
+                }
+            }
+            idxs
+        }
+    };
+
+    // 全表扫描
+    let out_rows = table.scan_all().map_err(|e| format!("scan_all failed: {}", e))?;
+
+    // 逐行：解码 → 过滤（用全列）→ 投影（只取 proj 下标）
+    let mut rows = Vec::new();
+    for (_row_id, record) in &out_rows {
+        let vals = decode_row(&table, record)?;
+        if let Some(f) = &filter {
+            if !eval_expr(f, &all_col_names, &vals)? {
+                continue;
+            }
+        }
+        let projected: Vec<String> = proj.iter()
+            .map(|&i| vals[i].to_string_readable())
+            .collect();
+        rows.push(projected);
+    }
+
+    // 输出的列名也只保留投影的
+    let out_col_names: Vec<String> = proj.iter()
+        .map(|&i| all_col_names[i].clone())
+        .collect();
+
+    Ok(ResultSet::Rows { columns: out_col_names, rows })
+}
 fn execute_delete(_t: String, _f: Option<Expr>, _db: &mut Database) -> Result<ResultSet, String> { todo!() }
 
 
@@ -152,6 +313,134 @@ mod tests {
 
         // 清理
         let _ = exec_sql(&mut db, &mut session, "DROP TABLE e2e_users");
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_select_star() {
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE q_users (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO q_users VALUES (1, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO q_users VALUES (2, 'Bob')").unwrap();
+
+        let r = exec_sql(&mut db, &mut session, "SELECT * FROM q_users").unwrap();
+        match r {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0], vec!["1".to_string(), "Alice".to_string()]);
+                assert_eq!(rows[1], vec!["2".to_string(), "Bob".to_string()]);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_select_where_gt() {
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE w_emp (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO w_emp VALUES (1, 20, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO w_emp VALUES (2, 17, 'Bob')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO w_emp VALUES (3, 25, 'Carter')").unwrap();
+
+        let r = exec_sql(&mut db, &mut session, "SELECT * FROM w_emp WHERE age > 18").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);                     // Alice 和 Carter
+                assert_eq!(rows[0][2], "Alice".to_string());
+                assert_eq!(rows[1][2], "Carter".to_string());
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_select_where_and_like() {
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE w_emp2 (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO w_emp2 VALUES (1, 20, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO w_emp2 VALUES (2, 20, 'Alan')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO w_emp2 VALUES (3, 30, 'Alan')").unwrap();
+
+        // WHERE age = 20 AND name LIKE 'Al%' → 前两条
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT * FROM w_emp2 WHERE age = 20 AND name LIKE 'Al%'").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][2], "Alice".to_string());
+                assert_eq!(rows[1][2], "Alan".to_string());
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_select_unknown_column_errors() {
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE w_bad (id INT PRIMARY KEY)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO w_bad VALUES (1)").unwrap();
+
+        // 引用不存在的列 → 语义错误，第三道防线
+        let err = exec_sql(&mut db, &mut session, "SELECT * FROM w_bad WHERE foo = 1").unwrap_err();
+        assert!(err.contains("not found"), "got: {}", err);
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_select_projection() {
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE p_emp (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO p_emp VALUES (1, 20, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO p_emp VALUES (2, 17, 'Bob')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO p_emp VALUES (3, 25, 'Carter')").unwrap();
+
+        // 只投影 name，但 WHERE 用 age —— "先筛行后删列"的活教材
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT name FROM p_emp WHERE age > 18").unwrap();
+        match r {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name".to_string()]);
+                assert_eq!(rows, vec![
+                    vec!["Alice".to_string()],
+                    vec!["Carter".to_string()],
+                ]);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // 列不存在 → 报错
+        let err = exec_sql(&mut db, &mut session, "SELECT ghost FROM p_emp").unwrap_err();
+        assert!(err.contains("not found"), "got: {}", err);
+
         let _ = db.shutdown();
     }
 }
