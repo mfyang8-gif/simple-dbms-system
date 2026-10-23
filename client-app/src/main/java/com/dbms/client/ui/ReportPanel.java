@@ -6,6 +6,11 @@ import org.jfree.chart.ChartFactory;
 import org.jfree.chart.ChartPanel;
 import org.jfree.chart.JFreeChart;
 import org.jfree.chart.StandardChartTheme;
+import org.jfree.chart.plot.CategoryPlot;
+import org.jfree.chart.plot.PiePlot;
+import org.jfree.chart.plot.Plot;
+import org.jfree.chart.renderer.category.BarRenderer;
+import org.jfree.chart.renderer.category.StandardBarPainter;
 import org.jfree.data.category.DefaultCategoryDataset;
 import org.jfree.data.general.DefaultPieDataset;
 
@@ -80,6 +85,9 @@ public class ReportPanel extends JPanel {
 
         setLayout(new BorderLayout(8, 8));
         setBorder(UiTheme.panelPadding());
+
+        // 年份显示成 2026 而不是 2,026：NumberEditor 默认带千分位分隔符
+        yearSpinner.setEditor(new JSpinner.NumberEditor(yearSpinner, "0"));
 
         // 报表表格不开表头排序：明细里有"合计"行，排序会把它一起排进去
         UiTheme.styleTable(table, false);
@@ -318,6 +326,7 @@ public class ReportPanel extends JPanel {
         currentChart = null;
         model.setDataVector(rows.toArray(new Object[0][]), ReportService.MONTH_BILL_HEADERS);
         UiTheme.fitColumns(table, 70, 220);
+        UiTheme.alignNumericColumns(table);
 
         // ③ 把 chartHolder 换成单据抬头
         showBillHeader(period, detail.size(), inTotal, outTotal);
@@ -455,6 +464,8 @@ public class ReportPanel extends JPanel {
             currentRows = rows;
             currentChart = null;
             model.setDataVector(rows.toArray(new Object[0][]), ReportService.STOCK_HEADERS);
+            UiTheme.fitColumns(table, 70, 220);
+            UiTheme.alignNumericColumns(table);
             showMessage("当前没有库存低于 " + threshold + " 的物料，库存正常。");
             return;
         }
@@ -473,16 +484,53 @@ public class ReportPanel extends JPanel {
     private JFreeChart makeChart(String title, String catAxis, String valAxis,
                                  DefaultCategoryDataset bar, DefaultPieDataset<String> pie) {
         String kind = (String) chartBox.getSelectedItem();
+        JFreeChart chart;
         if ("饼图".equals(kind)) {
             if (pie == null || pie.getKeys().isEmpty()) {
                 return null;                       // 没数据就别硬画
             }
-            return ChartFactory.createPieChart(title, pie);
+            chart = ChartFactory.createPieChart(title, pie);
+        } else if ("折线图".equals(kind)) {
+            chart = ChartFactory.createLineChart(title, catAxis, valAxis, bar);
+        } else {
+            chart = ChartFactory.createBarChart(title, catAxis, valAxis, bar);
         }
-        if ("折线图".equals(kind)) {
-            return ChartFactory.createLineChart(title, catAxis, valAxis, bar);
+        return styleChart(chart);
+    }
+
+    /**
+     * 图表扁平化：JFreeChart 默认是灰色绘图区 + 渐变高光 + 阴影，
+     * 和界面的 FlatLaf 浅色风格不搭。统一改成白底、浅灰网格、纯色柱条。
+     * 进仓用蓝、出仓用暗红 —— 减少的量用红色，符合仓库管理的阅读直觉。
+     */
+    private static final Color IN_COLOR = new Color(0x4E, 0x79, 0xA7);
+    private static final Color OUT_COLOR = new Color(0xB0, 0x44, 0x3C);
+
+    private static JFreeChart styleChart(JFreeChart chart) {
+        chart.setBackgroundPaint(Color.WHITE);
+        Plot plot = chart.getPlot();
+        plot.setBackgroundPaint(Color.WHITE);
+        plot.setOutlinePaint(UiTheme.GRID);
+        if (plot instanceof CategoryPlot cp) {
+            cp.setRangeGridlinePaint(UiTheme.GRID);
+            cp.setDomainGridlinesVisible(false);
+            if (cp.getRenderer() instanceof BarRenderer br) {
+                br.setBarPainter(new StandardBarPainter());   // 去掉渐变高光
+                br.setShadowVisible(false);
+                br.setSeriesPaint(0, IN_COLOR);
+                br.setSeriesPaint(1, OUT_COLOR);
+            } else {
+                cp.getRenderer().setSeriesPaint(0, IN_COLOR);
+                cp.getRenderer().setSeriesPaint(1, OUT_COLOR);
+            }
+        } else if (plot instanceof PiePlot<?> pp) {
+            pp.setShadowXOffset(0);
+            pp.setShadowYOffset(0);
+            pp.setLabelBackgroundPaint(Color.WHITE);
+            pp.setLabelOutlinePaint(UiTheme.GRID);
+            pp.setLabelShadowPaint(new Color(0, 0, 0, 0));    // 标签去阴影
         }
-        return ChartFactory.createBarChart(title, catAxis, valAxis, bar);
+        return chart;
     }
 
     private void apply(String[] headers, List<Object[]> rows, JFreeChart chart) {
@@ -491,6 +539,7 @@ public class ReportPanel extends JPanel {
         currentChart = chart;
         model.setDataVector(rows.toArray(new Object[0][]), headers);
         UiTheme.fitColumns(table, 70, 220);
+        UiTheme.alignNumericColumns(table);
         showChart(chart);
     }
 

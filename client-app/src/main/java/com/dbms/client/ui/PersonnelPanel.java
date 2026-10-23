@@ -118,7 +118,7 @@ public class PersonnelPanel extends JPanel {
         return panel;
     }
 
-    // ---------------- 底部表单 ----------------
+    // ---------------- 底部表单（两列四行 + 口令行） ----------------
 
     private JComponent buildForm() {
         JPanel form = new JPanel(new GridBagLayout());
@@ -127,41 +127,51 @@ public class PersonnelPanel extends JPanel {
         g.insets = new Insets(4, 6, 4, 6);
         g.anchor = GridBagConstraints.WEST;
 
-        addField(form, g, 0, "人员代码：", idField, idHint);
-        addField(form, g, 1, "姓名：", nameField, nameHint);
-        addField(form, g, 2, "性别：", genderBox, null);
-        addField(form, g, 3, "出生日期：", birthField, birthHint);
-
-        addField(form, g, 4, "身份证号：", idCardField, idCardHint);
-        addField(form, g, 5, "籍贯：", nativeField, null);
-        addField(form, g, 6, "家庭住址：", addressField, null);
-        addField(form, g, 7, "联系电话：", phoneField, phoneHint);
-
-        JPanel center = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 4));
-        center.add(new JLabel("设置口令："));
-        center.add(passwordField);
-        center.add(pwdHint);
-        center.add(new JLabel("（新增必填；修改时留空则不改）"));
+        // 两列布局：半区 0 占网格第 0~2 列，半区 1 占第 4~6 列（第 3 列是两半区之间的间隔）。
+        // 短字段并排，长字段（身份证/住址）单独一侧，高度比单列省一半，表格能多看几行。
+        addField(form, g, 0, 0, "人员代码：", idField, idHint);
+        addField(form, g, 0, 1, "姓名：", nameField, nameHint);
+        addField(form, g, 1, 0, "性别：", genderBox, null);
+        addField(form, g, 1, 1, "出生日期：", birthField, birthHint);
+        addField(form, g, 2, 0, "身份证号：", idCardField, idCardHint);
+        addField(form, g, 2, 1, "联系电话：", phoneField, phoneHint);
+        addField(form, g, 3, 0, "籍贯：", nativeField, null);
+        addField(form, g, 3, 1, "家庭住址：", addressField, null);
 
         saveButton = new JButton("保存");
         saveButton.addActionListener(e -> doSave());
-        center.add(saveButton);
 
-        JPanel wrapper = new JPanel(new BorderLayout());
-        wrapper.add(form, BorderLayout.CENTER);
-        wrapper.add(center, BorderLayout.SOUTH);
-        return wrapper;
+        // 最后一行：口令 + 保存。口令的规则提示放右边半区，跟其他提示同一排位置
+        g.gridy = 4;
+        g.gridx = 0;
+        form.add(new JLabel("设置口令："), g);
+        g.gridx = 1;
+        form.add(passwordField, g);
+        g.gridx = 2;
+        form.add(pwdHint, g);
+        g.gridx = 4;
+        form.add(UiTheme.muted("（新增必填；修改时留空则不改）"), g);
+        g.gridx = 5;
+        form.add(saveButton, g);
+
+        return form;
     }
 
-    private void addField(JPanel panel, GridBagConstraints g, int row, String label,
+    /**
+     * 往表单里加一组「标签 + 输入框 + 提示」。
+     *
+     * @param row  行号
+     * @param half 半区：0 = 左列（网格第 0~2 列），1 = 右列（网格第 4~6 列）
+     */
+    private void addField(JPanel panel, GridBagConstraints g, int row, int half, String label,
                           JComponent field, JLabel hint) {
-        g.gridx = 0;
         g.gridy = row;
+        g.gridx = half == 0 ? 0 : 4;
         panel.add(new JLabel(label), g);
-        g.gridx = 1;
+        g.gridx++;
         panel.add(field, g);
         if (hint != null) {
-            g.gridx = 2;
+            g.gridx++;
             panel.add(hint, g);
         }
     }
@@ -326,6 +336,7 @@ public class PersonnelPanel extends JPanel {
                 });
             }
             UiTheme.fitColumns(table, 80, 240);
+            UiTheme.alignNumericColumns(table);
             countLabel.setText(dataRows.isEmpty()
                     ? "没有符合条件的记录"
                     : "共 " + dataRows.size() + " 条记录");

@@ -627,6 +627,7 @@ public class InventoryPanel extends JPanel {
                 model.addRow(row);
             }
             UiTheme.fitColumns(table, 70, 220);
+            UiTheme.alignNumericColumns(table);
         } catch (Exception ex) {
             showError(ex);
         }

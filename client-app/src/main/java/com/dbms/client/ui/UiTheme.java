@@ -2,6 +2,7 @@ package com.dbms.client.ui;
 
 import javax.swing.*;
 import javax.swing.border.Border;
+import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.JTableHeader;
 import javax.swing.table.TableColumn;
 import java.awt.*;
@@ -120,6 +121,33 @@ public final class UiTheme {
                 }
             }
             column.setPreferredWidth(Math.max(minWidth, Math.min(maxWidth, width + 24)));
+        }
+    }
+
+    /**
+     * 让"整列都是数字"的列右对齐（代码、数量、金额这类列左对齐时位数参差，很难纵向比较）。
+     *
+     * 做法：逐列扫描，只有当该列所有非空值都是 Number 时才右对齐；
+     * 这样"合计""缺货"之类的文字列自动不受影响，新增报表也不用逐列手工指定。
+     *
+     * 注意：必须在 setDataVector / fitColumns 之后调用——
+     * setDataVector 会重建所有 TableColumn，之前设置的渲染器会一并丢失。
+     */
+    public static void alignNumericColumns(JTable table) {
+        for (int col = 0; col < table.getColumnCount(); col++) {
+            boolean allNumeric = table.getRowCount() > 0;
+            for (int row = 0; row < table.getRowCount(); row++) {
+                Object value = table.getValueAt(row, col);
+                if (value != null && !(value instanceof Number)) {
+                    allNumeric = false;
+                    break;
+                }
+            }
+            if (allNumeric) {
+                DefaultTableCellRenderer renderer = new DefaultTableCellRenderer();
+                renderer.setHorizontalAlignment(SwingConstants.RIGHT);
+                table.getColumnModel().getColumn(col).setCellRenderer(renderer);
+            }
         }
     }
 

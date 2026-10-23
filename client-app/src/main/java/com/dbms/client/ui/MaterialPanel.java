@@ -267,6 +267,7 @@ public class MaterialPanel extends JPanel {
                         m.getUnit(), m.getStockQty()});
             }
             UiTheme.fitColumns(table, 80, 240);
+            UiTheme.alignNumericColumns(table);
             countLabel.setText(dataRows.isEmpty()
                     ? "没有符合条件的记录"
                     : "共 " + dataRows.size() + " 条记录");
