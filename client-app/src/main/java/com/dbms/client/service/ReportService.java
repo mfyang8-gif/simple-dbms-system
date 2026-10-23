@@ -54,6 +54,17 @@ public class ReportService {
         public int total;            // 经手总量 = 进 + 出
     }
 
+    /** 库存预警行。 */
+    public static class StockRow {
+        public int code;
+        public String name;
+        public String spec;
+        public String unit;
+        public int stock;        // 当前库存
+        public int gap;          // 距阈值的差额
+        public String level;     // 缺货 / 偏低
+    }
+
     /** 物料仓库账本行。 */
     public static class LedgerRow {
         public int code;
@@ -71,6 +82,8 @@ public class ReportService {
             {"日期", "流水单号", "物料代码", "物料名称", "类型", "数量", "单位", "操作人ID", "备注"};
     public static final String[] PERSON_HEADERS =
             {"操作人ID", "姓名", "单据数", "进仓合计", "出仓合计", "经手总量", "涉及物料(种)"};
+    public static final String[] STOCK_HEADERS =
+            {"物料代码", "物料名称", "规格", "单位", "当前库存", "距阈值差额", "状态"};
 
     // ============================================================
     // 日期区间筛选工具
@@ -316,6 +329,42 @@ public class ReportService {
         List<PersonRow> rows = new ArrayList<>(agg.values());
         rows.sort(Comparator.comparingInt((PersonRow r) -> r.total).reversed()
                 .thenComparingInt(r -> r.operatorId));
+        return rows;
+    }
+
+    // ============================================================
+    // ⑥ 库存预警
+    // ============================================================
+
+    /**
+     * 库存预警：列出当前库存低于阈值 threshold 的物料，按库存从少到多排。
+     *
+     * 为什么阈值由界面传入，而不是存进 materials 表？
+     * init.sql 顶部写明"严格执行《核心数据表结构字典》，字段不要改"，
+     * materials 表只有 code/name/spec/unit/stock_qty，没有安全库存字段，也不允许新增。
+     * 于是把阈值做成界面参数——副作用反而是好事：同一份数据能按不同标准看，
+     * 而且不用为了改一个阈值去动表结构和 dao。
+     */
+    public List<StockRow> safetyStock(int threshold) {
+        List<StockRow> rows = new ArrayList<>();
+        for (Material m : materialDao.search("")) {
+            int stock = m.getStockQty();
+            if (stock >= threshold) {
+                continue;                       // 库存够用，不进预警
+            }
+            StockRow r = new StockRow();
+            r.code = m.getMaterialCode();
+            r.name = m.getName();
+            r.spec = m.getSpec();
+            r.unit = m.getUnit();
+            r.stock = stock;
+            r.gap = threshold - stock;
+            r.level = stock <= 0 ? "缺货" : "偏低";
+            rows.add(r);
+        }
+        // 库存越少越靠前；库存相同按代码升序，保证每次顺序一致
+        rows.sort(Comparator.comparingInt((StockRow r) -> r.stock)
+                .thenComparingInt(r -> r.code));
         return rows;
     }
 }

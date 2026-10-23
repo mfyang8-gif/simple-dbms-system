@@ -28,13 +28,24 @@ import java.util.List;
  *           因此每个报表同时准备 CategoryDataset（柱状/折线）与 PieDataset（饼图）。
  * 【第 8 课】新增"按操作人统计"报表：流水表按 operator_id 聚合，再关联人员表取姓名；
  *           同时把月份/图表两个下拉框的可用状态跟统计类型绑起来（明细单据不画图）。
+ * 【第 9 课】新增"库存预警"报表：库存低于界面阈值的物料单列，缺货与偏低分级；
+ *           阈值放界面而不入库，因为字典规定 materials 字段不可改。
  */
 public class ReportPanel extends JPanel {
 
     private final ReportService service = new ReportService();
 
     private final JComboBox<String> typeBox = new JComboBox<>(new String[]{
-            "按物料流量统计", "月度进出仓趋势", "月度进出仓单", "物料仓库账本", "按操作人统计"});
+            "按物料流量统计", "月度进出仓趋势", "月度进出仓单", "物料仓库账本",
+            "按操作人统计", "库存预警"});
+
+    /**
+     * 库存预警阈值。
+     * materials 表没有安全库存字段（字典规定字段不可改），
+     * 所以阈值放在界面上，由用户现场调整。
+     */
+    private final JSpinner thresholdSpinner =
+            new JSpinner(new SpinnerNumberModel(50, 1, 99999, 10));
 
     /** 第 2 课新增：图表类型。 */
     private final JComboBox<String> chartBox = new JComboBox<>(new String[]{
@@ -132,8 +143,18 @@ public class ReportPanel extends JPanel {
         monthBox.addActionListener(e -> doQuery());
         conditions.add(monthBox);
 
-        // ---- 第二行：图表类型 + 按钮 ----
+        // ---- 第二行：预警阈值 + 图表类型 + 按钮 ----
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
+
+        actions.add(new JLabel("预警阈值："));
+        thresholdSpinner.setToolTipText("当前库存低于该值的物料会列入预警（仅库存预警报表使用）");
+        // 只有当前正在看库存预警时才需要重查，切到别的报表时改阈值不该触发查询
+        thresholdSpinner.addChangeListener(e -> {
+            if ("库存预警".equals(typeBox.getSelectedItem())) {
+                doQuery();
+            }
+        });
+        actions.add(thresholdSpinner);
 
         actions.add(new JLabel("图表："));
         chartBox.addActionListener(e -> doQuery());
@@ -168,14 +189,15 @@ public class ReportPanel extends JPanel {
     }
 
     /**
-     * 控件联动：月份只对"月度进出仓单"有意义；
-     * 图表类型只对能画图的报表有意义——明细单据不画图，禁掉免得点了没反应。
+     * 控件联动：月份只对"月度进出仓单"有意义；图表类型对明细单据无意义；
+     * 预警阈值只对"库存预警"有意义——用不到就禁掉，别留"点了没反应"的控件。
      */
     private void updateControlEnabled() {
         String type = (String) typeBox.getSelectedItem();
         boolean isBill = "月度进出仓单".equals(type);
         monthBox.setEnabled(isBill);
         chartBox.setEnabled(!isBill);
+        thresholdSpinner.setEnabled("库存预警".equals(type));
     }
 
     /** 空串放行（表示不限），否则必须是 yyyy-MM-dd。 */
@@ -203,13 +225,15 @@ public class ReportPanel extends JPanel {
         int type = typeBox.getSelectedIndex();
         int year = (Integer) yearSpinner.getValue();
         int month = monthBox.getSelectedIndex() + 1;
+        int threshold = (Integer) thresholdSpinner.getValue();
         try {
             switch (type) {
                 case 0 -> loadFlow(from, to);
                 case 1 -> loadMonthly(year, from, to);
                 case 2 -> loadMonthBill(year, month, from, to);
                 case 3 -> loadLedger(from, to);
-                default -> loadPerson(from, to);
+                case 4 -> loadPerson(from, to);
+                default -> loadStock(threshold);
             }
         } catch (Exception ex) {
             showError(ex);
@@ -398,6 +422,44 @@ public class ReportPanel extends JPanel {
     }
 
     /**
+     * 第 9 课新增：库存预警。
+     *
+     * 数据只来自 materials 一张表（当前库存是物料档案上的存量字段），
+     * 判定规则：库存 &lt; 阈值。库存为 0 单独标"缺货"，其余标"偏低"。
+     * 阈值来自界面上的数字框，改一下立刻重新筛，不用动数据库。
+     */
+    private void loadStock(int threshold) {
+        List<ReportService.StockRow> list = service.safetyStock(threshold);
+        List<Object[]> rows = new ArrayList<>();
+        DefaultCategoryDataset bar = new DefaultCategoryDataset();
+        DefaultPieDataset<String> pie = new DefaultPieDataset<>();
+        for (ReportService.StockRow r : list) {
+            rows.add(new Object[]{r.code, r.name, r.spec, r.unit, r.stock, r.gap, r.level});
+            // 图表标签带物料代码：不同规格可能同名，靠名字做 key 会互相覆盖
+            String label = r.name + "(" + r.code + ")";
+            bar.addValue(r.stock, "当前库存", label);
+            if (r.stock > 0) {
+                pie.setValue(label, r.stock);       // 库存为 0 在饼图上没有意义
+            }
+        }
+        currentTitle = "库存预警（低于 " + threshold + "）";
+
+        if (list.isEmpty()) {
+            // 没有预警项：表格清空，图形位置直接说明"库存正常"，
+            // 避免一片空白让人以为报表出错了
+            currentHeaders = ReportService.STOCK_HEADERS;
+            currentRows = rows;
+            currentChart = null;
+            model.setDataVector(rows.toArray(new Object[0][]), ReportService.STOCK_HEADERS);
+            showMessage("当前没有库存低于 " + threshold + " 的物料，库存正常。");
+            return;
+        }
+
+        apply(ReportService.STOCK_HEADERS, rows,
+                makeChart(currentTitle, "物料", "当前库存", bar, pie));
+    }
+
+    /**
      * 第 2 课核心：按"图表类型"下拉框的选择生成图形。
      *
      * @param bar 柱状图 / 折线图用的数据源（有横轴概念）
@@ -428,13 +490,22 @@ public class ReportPanel extends JPanel {
     }
 
     private void showChart(JFreeChart chart) {
-        chartHolder.removeAll();
-        if (chart != null) {
-            chartHolder.add(new ChartPanel(chart), BorderLayout.CENTER);
-        } else {
-            chartHolder.add(new JLabel("该报表当前类型下无图形（或数据为空）。",
-                    SwingConstants.CENTER), BorderLayout.CENTER);
+        if (chart == null) {
+            showMessage("该报表当前类型下无图形（或数据为空）。");
+            return;
         }
+        chartHolder.removeAll();
+        chartHolder.add(new ChartPanel(chart), BorderLayout.CENTER);
+        chartHolder.revalidate();
+        chartHolder.repaint();
+    }
+
+    /** 在原本放图表的位置显示一句提示（无数据、无需预警等场景）。 */
+    private void showMessage(String text) {
+        chartHolder.removeAll();
+        JLabel label = new JLabel(text, SwingConstants.CENTER);
+        label.setFont(new Font("微软雅黑", Font.PLAIN, 15));
+        chartHolder.add(label, BorderLayout.CENTER);
         chartHolder.revalidate();
         chartHolder.repaint();
     }
