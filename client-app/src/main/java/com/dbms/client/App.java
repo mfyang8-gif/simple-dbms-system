@@ -1,6 +1,7 @@
 package com.dbms.client;
 
 import com.dbms.client.ui.LoginFrame;
+import com.dbms.client.ui.UiTheme;
 import com.dbms.client.update.UpdateChecker;
 
 import javax.swing.*;
@@ -22,6 +23,9 @@ public class App {
 
         SwingUtilities.invokeLater(() -> {
             setupLookAndFeel();
+            // 统一字体与表格外观 —— 必须在 setLookAndFeel 之后，
+            // 否则 UIManager 里刚写进去的默认值会被 LAF 的默认值覆盖。
+            UiTheme.install();
             new LoginFrame().setVisible(true);
         });
     }

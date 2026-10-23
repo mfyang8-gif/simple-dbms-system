@@ -14,10 +14,12 @@ public class MainFrame extends JFrame {
     public MainFrame(Personnel user) {
         this.currentUser = user;
         setTitle("简易仓库管理系统    当前用户：" + user.getName() + "（" + user.roleLabel() + "）");
-        setSize(1020, 700);
-        setMinimumSize(new Dimension(880, 600));
+        // 报表页有图表 + 表格 + 两行工具栏，窄了会挤，默认给足宽度
+        setSize(1180, 760);
+        setMinimumSize(new Dimension(980, 680));
         setLocationRelativeTo(null);
         setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setIconImage(UiTheme.appIcon());
 
         content.add(new PersonnelPanel(user), "personnel");
         content.add(new MaterialPanel(), "material");
@@ -42,7 +44,7 @@ public class MainFrame extends JFrame {
         bar.add(inout);
 
         JMenu report = new JMenu("统计报表");
-        report.add(menuItem("流量统计 / 月报 / 账本", "report"));
+        report.add(menuItem("各类统计与导出", "report"));
         bar.add(report);
 
         // ---- 动态权限：只有管理员才看得到"权限管理" ----

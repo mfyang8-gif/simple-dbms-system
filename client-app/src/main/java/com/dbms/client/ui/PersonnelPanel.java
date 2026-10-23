@@ -25,10 +25,6 @@ public class PersonnelPanel extends JPanel {
     private static final String[] COLUMNS =
             {"人员代码", "姓名", "性别", "出生日期", "身份证号", "籍贯", "家庭住址", "联系电话", "权限"};
 
-    private static final Color OK_COLOR = new Color(0x0F, 0x6E, 0x56);
-    private static final Color ERR_COLOR = new Color(0xA3, 0x2D, 0x2D);
-    private static final Color IDLE_COLOR = new Color(0x8A, 0x8A, 0x85);
-
     private final PersonnelService service = new PersonnelService();
     private final Personnel currentUser;
 
@@ -61,13 +57,16 @@ public class PersonnelPanel extends JPanel {
     private final JLabel pwdHint = hintLabel();
     private JButton saveButton;
 
+    private final JLabel countLabel = UiTheme.muted("");
+
     private boolean creating = false;
 
     public PersonnelPanel(Personnel currentUser) {
         this.currentUser = currentUser;
         setLayout(new BorderLayout(8, 8));
-        setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        setBorder(UiTheme.panelPadding());
 
+        UiTheme.styleTable(table, true);
         add(buildToolbar(), BorderLayout.NORTH);
         add(new JScrollPane(table), BorderLayout.CENTER);
         add(buildForm(), BorderLayout.SOUTH);
@@ -80,36 +79,42 @@ public class PersonnelPanel extends JPanel {
 
         bindLiveValidation();
         reload();
+        validateLive();     // 初始状态：未填任何内容时显示"必填"、保存按钮禁用
     }
 
     // ---------------- 顶部工具栏 ----------------
 
     private JComponent buildToolbar() {
-        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
-        panel.add(new JLabel("关键字："));
-        panel.add(keywordField);
-        panel.add(new JLabel("（姓名 / 籍贯 / 电话 子串模糊）"));
+        JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
+        left.add(new JLabel("关键字："));
+        left.add(keywordField);
+        left.add(UiTheme.muted("（姓名 / 籍贯 / 电话 子串模糊）"));
 
         JButton searchButton = new JButton("查询");
         searchButton.addActionListener(e -> reload());
-        panel.add(searchButton);
+        left.add(searchButton);
 
         JButton newButton = new JButton("新增");
         newButton.addActionListener(e -> startCreate());
-        panel.add(newButton);
+        left.add(newButton);
 
         JButton deleteButton = new JButton("删除");
         deleteButton.addActionListener(e -> doDelete());
-        panel.add(deleteButton);
+        left.add(deleteButton);
 
         // 只有管理员能授予/回收权限 —— 动态控制控件可见性
         if (currentUser.getRoleId() == 1) {
             JButton roleButton = new JButton("授予/回收管理员");
             roleButton.addActionListener(e -> toggleRole());
-            panel.add(roleButton);
+            left.add(roleButton);
         }
 
         keywordField.addActionListener(e -> reload());
+
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.add(left, BorderLayout.WEST);
+        countLabel.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, UiTheme.PAD));
+        panel.add(countLabel, BorderLayout.EAST);
         return panel;
     }
 
@@ -165,8 +170,8 @@ public class PersonnelPanel extends JPanel {
 
     private static JLabel hintLabel() {
         JLabel l = new JLabel(" ");
-        l.setFont(new Font("微软雅黑", Font.PLAIN, 12));
-        l.setForeground(IDLE_COLOR);
+        l.setFont(UiTheme.SMALL);
+        l.setForeground(UiTheme.MUTED);
         return l;
     }
 
@@ -296,7 +301,7 @@ public class PersonnelPanel extends JPanel {
 
     private void setHint(JLabel label, String text, boolean ok) {
         label.setText(text);
-        label.setForeground(ok ? OK_COLOR : ERR_COLOR);
+        label.setForeground(ok ? UiTheme.OK : UiTheme.ERROR);
     }
 
     private boolean isRealDate(String s) {
@@ -320,6 +325,10 @@ public class PersonnelPanel extends JPanel {
                         p.getNativePlace(), p.getAddress(), p.getPhone(), p.roleLabel()
                 });
             }
+            UiTheme.fitColumns(table, 80, 240);
+            countLabel.setText(dataRows.isEmpty()
+                    ? "没有符合条件的记录"
+                    : "共 " + dataRows.size() + " 条记录");
         } catch (Exception ex) {
             showError(ex);
         }
@@ -346,11 +355,16 @@ public class PersonnelPanel extends JPanel {
     }
 
     private void fillFormFromSelection() {
-        int row = table.getSelectedRow();
-        if (row < 0 || row >= dataRows.size()) {
+        int viewRow = table.getSelectedRow();
+        if (viewRow < 0) {
             return;
         }
-        Personnel p = dataRows.get(row);
+        // 表头可排序后，视图行号 ≠ 数据行号，必须转换
+        int modelRow = table.convertRowIndexToModel(viewRow);
+        if (modelRow < 0 || modelRow >= dataRows.size()) {
+            return;
+        }
+        Personnel p = dataRows.get(modelRow);
         creating = false;
         idField.setText(String.valueOf(p.getId()));
         nameField.setText(p.getName());
@@ -415,12 +429,16 @@ public class PersonnelPanel extends JPanel {
     }
 
     private void doDelete() {
-        int row = table.getSelectedRow();
-        if (row < 0 || row >= dataRows.size()) {
+        int viewRow = table.getSelectedRow();
+        if (viewRow < 0) {
             JOptionPane.showMessageDialog(this, "请先在表格中选择一条记录", "提示", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        Personnel p = dataRows.get(row);
+        int modelRow = table.convertRowIndexToModel(viewRow);
+        if (modelRow < 0 || modelRow >= dataRows.size()) {
+            return;
+        }
+        Personnel p = dataRows.get(modelRow);
         if (p.getId() == currentUser.getId()) {
             JOptionPane.showMessageDialog(this, "不能删除当前登录用户", "提示", JOptionPane.WARNING_MESSAGE);
             return;
@@ -439,12 +457,16 @@ public class PersonnelPanel extends JPanel {
     }
 
     private void toggleRole() {
-        int row = table.getSelectedRow();
-        if (row < 0 || row >= dataRows.size()) {
+        int viewRow = table.getSelectedRow();
+        if (viewRow < 0) {
             JOptionPane.showMessageDialog(this, "请先在表格中选择一条记录", "提示", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        Personnel p = dataRows.get(row);
+        int modelRow = table.convertRowIndexToModel(viewRow);
+        if (modelRow < 0 || modelRow >= dataRows.size()) {
+            return;
+        }
+        Personnel p = dataRows.get(modelRow);
         if (p.getId() == currentUser.getId()) {
             JOptionPane.showMessageDialog(this, "不能修改自己的权限", "提示", JOptionPane.WARNING_MESSAGE);
             return;

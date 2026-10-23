@@ -55,7 +55,8 @@ public class InventoryPanel extends JPanel {
     public InventoryPanel(Personnel currentUser) {
         this.currentUser = currentUser;
         setLayout(new BorderLayout(8, 8));
-        setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        setBorder(UiTheme.panelPadding());
+        UiTheme.styleTable(table, true);
 
         JPanel top = new JPanel(new BorderLayout(8, 8));
         top.add(buildSingleMoveBar(), BorderLayout.NORTH);
@@ -115,7 +116,7 @@ public class InventoryPanel extends JPanel {
         });
 
         JPanel preview = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        stockLabel.setFont(new Font("微软雅黑", Font.PLAIN, 13));
+        stockLabel.setFont(UiTheme.BODY);
         preview.add(stockLabel);
 
         // 「多物料进出仓…」放第二行：第一行放不下会被 FlowLayout 换行并裁掉（同工具栏挤爆的坑）
@@ -346,10 +347,10 @@ public class InventoryPanel extends JPanel {
         JComboBox<String> dialogType = new JComboBox<>(new String[]{"进仓", "出仓"});
         JTextField dialogRemarks = new JTextField(14);
         JLabel totalLabel = new JLabel(" ");
-        totalLabel.setFont(new Font("微软雅黑", Font.BOLD, 13));
+        totalLabel.setFont(UiTheme.BODY_BOLD);
 
         JLabel hintLabel = new JLabel("提示：点数量格子直接输入，按回车确认并跳到下一行；也可点「✓ 确认本行」");
-        hintLabel.setFont(new Font("微软雅黑", Font.PLAIN, 12));
+        hintLabel.setFont(UiTheme.SMALL);
         hintLabel.setForeground(new Color(0x7A, 0x7A, 0x76));
 
         JDialog dialog = new JDialog(SwingUtilities.getWindowAncestor(this),
@@ -376,7 +377,7 @@ public class InventoryPanel extends JPanel {
         JButton delRow = new JButton("删选中行");
         JButton confirmRow = new JButton("✓ 确认本行");
         JButton submit = new JButton("提交本单");
-        submit.setFont(new Font("微软雅黑", Font.BOLD, 13));
+        submit.setFont(UiTheme.BODY_BOLD);
 
         JPanel bottom = new JPanel(new BorderLayout(8, 4));
         JPanel btns = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 4));
@@ -550,7 +551,7 @@ public class InventoryPanel extends JPanel {
             super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
             String text = value == null ? "" : value.toString().trim();
             setHorizontalAlignment(SwingConstants.RIGHT);
-            setFont(new Font("微软雅黑", Font.PLAIN, 13));
+            setFont(UiTheme.BODY);
 
             if (text.isEmpty()) {
                 setText("点这里输入");
@@ -625,6 +626,7 @@ public class InventoryPanel extends JPanel {
             for (Object[] row : dataRows) {
                 model.addRow(row);
             }
+            UiTheme.fitColumns(table, 70, 220);
         } catch (Exception ex) {
             showError(ex);
         }

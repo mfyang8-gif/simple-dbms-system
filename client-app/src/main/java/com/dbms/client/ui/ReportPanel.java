@@ -79,7 +79,10 @@ public class ReportPanel extends JPanel {
         setupChartFont();
 
         setLayout(new BorderLayout(8, 8));
-        setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        setBorder(UiTheme.panelPadding());
+
+        // 报表表格不开表头排序：明细里有"合计"行，排序会把它一起排进去
+        UiTheme.styleTable(table, false);
 
         add(buildToolbar(), BorderLayout.NORTH);
 
@@ -98,12 +101,12 @@ public class ReportPanel extends JPanel {
      * 必须在创建任何图表之前调用（全局生效，调用一次即可）。
      */
     private static void setupChartFont() {
-        Font font = new Font("微软雅黑", Font.PLAIN, 13);
+        Font font = UiTheme.BODY;
         StandardChartTheme theme = new StandardChartTheme("CN");
         theme.setExtraLargeFont(font.deriveFont(Font.BOLD, 16f));   // 图表标题
         theme.setLargeFont(font.deriveFont(13f));                   // 坐标轴标题
         theme.setRegularFont(font);                                 // 刻度、图例
-        theme.setSmallFont(font.deriveFont(11f));
+        theme.setSmallFont(UiTheme.SMALL);
         ChartFactory.setChartTheme(theme);
     }
 
@@ -314,6 +317,7 @@ public class ReportPanel extends JPanel {
         currentRows = rows;
         currentChart = null;
         model.setDataVector(rows.toArray(new Object[0][]), ReportService.MONTH_BILL_HEADERS);
+        UiTheme.fitColumns(table, 70, 220);
 
         // ③ 把 chartHolder 换成单据抬头
         showBillHeader(period, detail.size(), inTotal, outTotal);
@@ -326,21 +330,21 @@ public class ReportPanel extends JPanel {
         header.setBorder(BorderFactory.createEmptyBorder(14, 20, 14, 20));
 
         JLabel title = new JLabel("简易仓库管理系统 —— 物料进出仓单");
-        title.setFont(new Font("微软雅黑", Font.BOLD, 20));
+        title.setFont(UiTheme.APP_TITLE);
         title.setAlignmentX(Component.CENTER_ALIGNMENT);
 
         JLabel periodLabel = new JLabel("统计期间：" + period);
-        periodLabel.setFont(new Font("微软雅黑", Font.PLAIN, 13));
+        periodLabel.setFont(UiTheme.BODY);
         periodLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
 
         JLabel timeLabel = new JLabel("制表时间："
                 + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")));
-        timeLabel.setFont(new Font("微软雅黑", Font.PLAIN, 13));
+        timeLabel.setFont(UiTheme.BODY);
         timeLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
 
         JLabel sumLabel = new JLabel(String.format(
                 "共 %d 笔　进仓合计：%d　出仓合计：%d", count, inTotal, outTotal));
-        sumLabel.setFont(new Font("微软雅黑", Font.BOLD, 14));
+        sumLabel.setFont(UiTheme.BODY.deriveFont(Font.BOLD, 14f));
         sumLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
 
         header.add(title);
@@ -486,6 +490,7 @@ public class ReportPanel extends JPanel {
         currentRows = rows;
         currentChart = chart;
         model.setDataVector(rows.toArray(new Object[0][]), headers);
+        UiTheme.fitColumns(table, 70, 220);
         showChart(chart);
     }
 
@@ -504,7 +509,7 @@ public class ReportPanel extends JPanel {
     private void showMessage(String text) {
         chartHolder.removeAll();
         JLabel label = new JLabel(text, SwingConstants.CENTER);
-        label.setFont(new Font("微软雅黑", Font.PLAIN, 15));
+        label.setFont(UiTheme.HEADING);
         chartHolder.add(label, BorderLayout.CENTER);
         chartHolder.revalidate();
         chartHolder.repaint();
