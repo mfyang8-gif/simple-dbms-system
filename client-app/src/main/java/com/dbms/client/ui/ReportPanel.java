@@ -26,13 +26,15 @@ import java.util.List;
  * 【第 2 课】新增"图表类型"下拉框，可切换柱状图 / 折线图 / 饼图。
  *           知识点：同一份数据喂给不同的 ChartFactory 方法就得到不同图形，
  *           因此每个报表同时准备 CategoryDataset（柱状/折线）与 PieDataset（饼图）。
+ * 【第 8 课】新增"按操作人统计"报表：流水表按 operator_id 聚合，再关联人员表取姓名；
+ *           同时把月份/图表两个下拉框的可用状态跟统计类型绑起来（明细单据不画图）。
  */
 public class ReportPanel extends JPanel {
 
     private final ReportService service = new ReportService();
 
     private final JComboBox<String> typeBox = new JComboBox<>(new String[]{
-            "按物料流量统计", "月度进出仓趋势", "月度进出仓单", "物料仓库账本"});
+            "按物料流量统计", "月度进出仓趋势", "月度进出仓单", "物料仓库账本", "按操作人统计"});
 
     /** 第 2 课新增：图表类型。 */
     private final JComboBox<String> chartBox = new JComboBox<>(new String[]{
@@ -76,7 +78,7 @@ public class ReportPanel extends JPanel {
         split.setResizeWeight(0.55);
         add(split, BorderLayout.CENTER);
 
-        updateMonthEnabled();
+        updateControlEnabled();
         doQuery();
     }
 
@@ -115,9 +117,9 @@ public class ReportPanel extends JPanel {
         toField.addActionListener(e -> doQuery());
 
         conditions.add(new JLabel("统计类型："));
-        // 切换统计类型时：① 更新月份输入框可用状态 ② 立即重新查询并重绘
+        // 切换统计类型时：① 更新月份/图表的可用状态 ② 立即重新查询并重绘
         typeBox.addActionListener(e -> {
-            updateMonthEnabled();
+            updateControlEnabled();
             doQuery();
         });
         conditions.add(typeBox);
@@ -165,8 +167,15 @@ public class ReportPanel extends JPanel {
         return rows;
     }
 
-    private void updateMonthEnabled() {
-        monthBox.setEnabled(typeBox.getSelectedIndex() == 2);
+    /**
+     * 控件联动：月份只对"月度进出仓单"有意义；
+     * 图表类型只对能画图的报表有意义——明细单据不画图，禁掉免得点了没反应。
+     */
+    private void updateControlEnabled() {
+        String type = (String) typeBox.getSelectedItem();
+        boolean isBill = "月度进出仓单".equals(type);
+        monthBox.setEnabled(isBill);
+        chartBox.setEnabled(!isBill);
     }
 
     /** 空串放行（表示不限），否则必须是 yyyy-MM-dd。 */
@@ -199,7 +208,8 @@ public class ReportPanel extends JPanel {
                 case 0 -> loadFlow(from, to);
                 case 1 -> loadMonthly(year, from, to);
                 case 2 -> loadMonthBill(year, month, from, to);
-                default -> loadLedger(from, to);
+                case 3 -> loadLedger(from, to);
+                default -> loadPerson(from, to);
             }
         } catch (Exception ex) {
             showError(ex);
@@ -357,6 +367,34 @@ public class ReportPanel extends JPanel {
         currentTitle = "物料仓库账本";
         apply(ReportService.LEDGER_HEADERS, rows,
                 makeChart(currentTitle, "物料", "数量", bar, pie));
+    }
+
+    /**
+     * 第 8 课新增：按操作人统计工作量。
+     *
+     * inventory_logs.operator_id 指向 personnel.id，
+     * 所以这是一张"单事实表 + 维表"的典型报表：
+     * 单据数、进出仓量来自流水表，姓名来自人员表。
+     */
+    private void loadPerson(String from, String to) {
+        List<ReportService.PersonRow> list = service.flowByOperator(from, to);
+        List<Object[]> rows = new ArrayList<>();
+        DefaultCategoryDataset bar = new DefaultCategoryDataset();
+        DefaultPieDataset<String> pie = new DefaultPieDataset<>();
+        for (ReportService.PersonRow r : list) {
+            rows.add(new Object[]{r.operatorId, r.name, r.billCount,
+                    r.inQty, r.outQty, r.total, r.materialKinds});
+            // 图表里带上工号：万一有人重名，两个柱子/扇区不会互相覆盖
+            String label = r.name + "(" + r.operatorId + ")";
+            bar.addValue(r.inQty, "进仓", label);
+            bar.addValue(r.outQty, "出仓", label);
+            if (r.total > 0) {
+                pie.setValue(label, r.total);
+            }
+        }
+        currentTitle = "按操作人进出仓工作量";
+        apply(ReportService.PERSON_HEADERS, rows,
+                makeChart(currentTitle, "操作人", "数量", bar, pie));
     }
 
     /**

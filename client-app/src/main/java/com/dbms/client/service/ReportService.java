@@ -2,15 +2,19 @@ package com.dbms.client.service;
 
 import com.dbms.client.dao.InventoryLogDao;
 import com.dbms.client.dao.MaterialDao;
+import com.dbms.client.dao.PersonnelDao;
 import com.dbms.client.entity.InventoryLog;
 import com.dbms.client.entity.Material;
+import com.dbms.client.entity.Personnel;
 
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 报表统计。
@@ -27,6 +31,7 @@ public class ReportService {
 
     private final MaterialDao materialDao = new MaterialDao();
     private final InventoryLogDao logDao = new InventoryLogDao();
+    private final PersonnelDao personnelDao = new PersonnelDao();
 
     /** 按物料统计进出仓流量。 */
     public static class FlowRow {
@@ -36,6 +41,17 @@ public class ReportService {
         public int inQty;
         public int outQty;
         public int stock;
+    }
+
+    /** 按操作人统计的工作量。 */
+    public static class PersonRow {
+        public int operatorId;
+        public String name;
+        public int billCount;        // 经手的流水单数
+        public int inQty;            // 进仓合计
+        public int outQty;           // 出仓合计
+        public int materialKinds;    // 涉及物料种数（去重）
+        public int total;            // 经手总量 = 进 + 出
     }
 
     /** 物料仓库账本行。 */
@@ -53,6 +69,8 @@ public class ReportService {
     public static final String[] LEDGER_HEADERS = {"物料代码", "物料名称", "单位", "期初", "入库", "出库", "结存"};
     public static final String[] MONTH_BILL_HEADERS =
             {"日期", "流水单号", "物料代码", "物料名称", "类型", "数量", "单位", "操作人ID", "备注"};
+    public static final String[] PERSON_HEADERS =
+            {"操作人ID", "姓名", "单据数", "进仓合计", "出仓合计", "经手总量", "涉及物料(种)"};
 
     // ============================================================
     // 日期区间筛选工具
@@ -235,6 +253,69 @@ public class ReportService {
             r.opening = f.stock - f.inQty + f.outQty;
             rows.add(r);
         }
+        return rows;
+    }
+
+    // ============================================================
+    // ⑤ 按操作人统计工作量
+    // ============================================================
+
+    /** 按操作人统计工作量（不限日期）。 */
+    public List<PersonRow> flowByOperator() {
+        return flowByOperator(null, null);
+    }
+
+    /**
+     * 按操作人统计工作量：单据数、进出仓合计、涉及物料种数。
+     *
+     * 为什么不写 SQL 聚合？
+     * 这里要用到 COUNT(DISTINCT material_code) 和按 operator_id 分组再关联 personnel 表，
+     * 底层自研引擎对多列 GROUP BY / 子查询 / HAVING 都不支持，
+     * 于是沿用本类的统一策略：明细一次拉回内存，用 Java 聚合。
+     */
+    public List<PersonRow> flowByOperator(String fromDate, String toDate) {
+        // ① operator_id 是指向 personnel.id 的外键，先建 id -> 姓名 映射。
+        //    人员可能已被删除，查不到时第 ③ 步要能优雅降级。
+        Map<Integer, String> names = new HashMap<>();
+        for (Personnel p : personnelDao.search("")) {
+            names.put(p.getId(), p.getName());
+        }
+
+        // ② 按操作人累积；Set 用来统计"涉及物料种数"（自动去重）
+        Map<Integer, PersonRow> agg = new LinkedHashMap<>();
+        Map<Integer, Set<Integer>> kinds = new HashMap<>();
+        for (InventoryLog log : logDao.listAll()) {
+            if (!inRange(log.getOpDate(), fromDate, toDate)) {
+                continue;
+            }
+            int op = log.getOperatorId();
+            PersonRow r = agg.computeIfAbsent(op, k -> {
+                PersonRow nr = new PersonRow();
+                nr.operatorId = k;
+                return nr;
+            });
+            r.billCount++;
+            if (InventoryService.IN.equalsIgnoreCase(log.getOpType())) {
+                r.inQty += log.getQty();
+            } else {
+                r.outQty += log.getQty();
+            }
+            kinds.computeIfAbsent(op, k -> new HashSet<>()).add(log.getMaterialCode());
+        }
+
+        // ③ 补姓名、种数、总量
+        for (PersonRow r : agg.values()) {
+            String n = names.get(r.operatorId);
+            r.name = (n == null || n.isEmpty()) ? "(已删除)" : n;
+            Set<Integer> ks = kinds.get(r.operatorId);
+            r.materialKinds = ks == null ? 0 : ks.size();
+            r.total = r.inQty + r.outQty;
+        }
+
+        // ④ 按经手总量降序，一眼看出谁干得多；总量相同的按 ID 升序，保证结果稳定
+        List<PersonRow> rows = new ArrayList<>(agg.values());
+        rows.sort(Comparator.comparingInt((PersonRow r) -> r.total).reversed()
+                .thenComparingInt(r -> r.operatorId));
         return rows;
     }
 }
