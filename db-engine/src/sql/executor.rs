@@ -3,6 +3,7 @@
 use crate::sql::ast::*;
 use crate::database::Database;
 use crate::table::{Column, ColumnType};
+use crate::types::RowId;
 /// 执行结果：SELECT 返回行，其它语句返回受影响行数
 use crate::row::RowBuilder;
 // 你之前只 import 了 Column，加个 ColumnType
@@ -10,6 +11,7 @@ use crate::record::Record;
 use crate::row::Row;
 use crate::table::Table;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 #[derive(Debug)]
 pub enum ResultSet {
     Rows { columns: Vec<String>, rows: Vec<Vec<String>> },
@@ -86,7 +88,7 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
         }
         Statement::DropTable { name } => execute_drop_table(name, db),
         Statement::Insert { table, columns, values } => execute_insert(table, columns, values, db, session),
-        Statement::Select { columns, table, filter, .. } => execute_select(columns, table, filter, db),
+        Statement::Select { columns, table, filter, order_by, .. } => execute_select(columns, table, filter, order_by, db),
         Statement::Delete { table, filter } => execute_delete(table, filter, db, session),
         Statement::Begin => {
             if session.txn_id.is_some() {
@@ -120,7 +122,7 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
             session.txn_id = None;
             Ok(ResultSet::Ok)
         }
-        Statement::Update { .. } => Err("UPDATE not yet implemented".into()),
+        Statement::Update { table, assignments, filter } => execute_update(table, assignments, filter, db, session),
     }
 }
 
@@ -241,7 +243,7 @@ fn eval_expr(expr: &Expr, col_names: &[String], vals: &[Value]) -> Result<bool, 
         other => Err(format!("unsupported filter expression: {:?}", other)),
     }
 }
-fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<Expr>, db: &mut Database) -> Result<ResultSet, String> {
+fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<Expr>, order_by: Vec<OrderByItem>, db: &mut Database) -> Result<ResultSet, String> {
     let table = db.open_table(&table_name)
         .map_err(|e| format!("open_table failed: {}", e))?;
 
@@ -267,11 +269,19 @@ fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<E
         }
     };
 
+    // 先把 ORDER BY 的列名解析成下标（提前报错，不拖到扫完）
+    let mut sort_keys: Vec<(usize, bool)> = Vec::new();
+    for item in &order_by {
+        let i = all_col_names.iter().position(|c| c == &item.column)
+            .ok_or_else(|| format!("column '{}' not found in ORDER BY", item.column))?;
+        sort_keys.push((i, item.asc));
+    }
+
     // 全表扫描
     let out_rows = table.scan_all().map_err(|e| format!("scan_all failed: {}", e))?;
 
-    // 逐行：解码 → 过滤（用全列）→ 投影（只取 proj 下标）
-    let mut rows = Vec::new();
+    // 逐行：解码 → 过滤（用全列），先不投影（ORDER BY 可能引用不在 SELECT 里的列）
+    let mut decoded: Vec<Vec<Value>> = Vec::new();
     for (_row_id, record) in &out_rows {
         let vals = decode_row(&table, record)?;
         if let Some(f) = &filter {
@@ -279,11 +289,30 @@ fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<E
                 continue;
             }
         }
-        let projected: Vec<String> = proj.iter()
-            .map(|&i| vals[i].to_string_readable())
-            .collect();
-        rows.push(projected);
+        decoded.push(vals);
     }
+
+    // 排序（在投影之前，直接用源表列的值比较）
+    if !sort_keys.is_empty() {
+        decoded.sort_by(|a, b| {
+            for &(idx, asc) in &sort_keys {
+                let ord = match (&a[idx], &b[idx]) {
+                    (Value::Int(x), Value::Int(y)) => x.cmp(y),
+                    (Value::Str(x), Value::Str(y)) => x.cmp(y),
+                    _ => std::cmp::Ordering::Equal,
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return if asc { ord } else { ord.reverse() };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    // 投影（只取 proj 下标）
+    let rows: Vec<Vec<String>> = decoded.iter()
+        .map(|vals| proj.iter().map(|&i| vals[i].to_string_readable()).collect())
+        .collect();
 
     // 输出的列名也只保留投影的
     let out_col_names: Vec<String> = proj.iter()
@@ -321,6 +350,123 @@ fn execute_delete(t: String, f: Option<Expr>, db: &mut Database, session: &mut S
     Ok(ResultSet::Affected(count))
 }
 
+/// 唯一性预检：把"改完之后"的键集合算出来，检查新行之间、以及新行与"没被改的旧行"是否撞车。
+/// 必须在动任何数据之前跑完，否则删了旧行才发现冲突，表就残了。
+fn check_update_unique_keys(table: &Table, plan: &[(RowId, Vec<Value>)]) -> Result<(), String> {
+    let unique_cols: Vec<usize> = table.columns.iter().enumerate()
+        .filter(|(_, c)| c.primary_key || c.unique)
+        .map(|(i, _)| i)
+        .collect();
+    if unique_cols.is_empty() {
+        return Ok(());
+    }
+
+    let key_of = |vals: &[Value]| -> Vec<String> {
+        unique_cols.iter().map(|&i| vals[i].to_string_readable()).collect()
+    };
+
+    // ① 没被 UPDATE 碰到的行 → 它们的键继续被占用
+    let changing: HashSet<RowId> = plan.iter().map(|(id, _)| *id).collect();
+    let mut taken: HashSet<Vec<String>> = HashSet::new();
+    for (row_id, record) in table.scan_all().map_err(|e| format!("scan_all failed: {}", e))? {
+        if changing.contains(&row_id) {
+            continue;
+        }
+        taken.insert(key_of(&decode_row(table, &record)?));
+    }
+
+    // ② 新行逐个占坑，insert 失败 = 自己跟自己或跟旧行重复
+    for (_, new_vals) in plan {
+        if !taken.insert(key_of(new_vals)) {
+            let col = &table.columns[unique_cols[0]];
+            let kind = if col.primary_key { "PRIMARY KEY" } else { "UNIQUE" };
+            return Err(format!("Duplicate value for {} column '{}'", kind, col.name));
+        }
+    }
+    Ok(())
+}
+
+/// UPDATE 的落地策略：**删旧行 + 插新行**。
+/// 为什么不原地改字节：页层只有 insert/delete 两套 WAL 记录，没有 update_record；
+/// 而 delete + insert 的 before/after 镜像已经完整，ROLLBACK 时倒着撤就能还原。
+fn execute_update(
+    table_name: String,
+    assignments: Vec<(String, Expr)>,
+    filter: Option<Expr>,
+    db: &mut Database,
+    session: &mut Session,
+) -> Result<ResultSet, String> {
+    if assignments.is_empty() {
+        return Err("UPDATE requires at least one assignment".to_string());
+    }
+
+    let mut table = db.open_table(&table_name)
+        .map_err(|e| format!("open_table failed: {}", e))?;
+    let all_col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+
+    // ① SET 的列名先解析成下标：列名写错要在动数据之前报出来
+    let mut set_items: Vec<(usize, Expr)> = Vec::new();
+    for (name, expr) in assignments {
+        let idx = all_col_names.iter().position(|c| c == &name)
+            .ok_or_else(|| format!("column '{}' not found in UPDATE", name))?;
+        set_items.push((idx, expr));
+    }
+
+    // ② 扫描 + 过滤 + 在内存里算出每行的新值（此时一个字节都还没改）
+    let scanned = table.scan_all().map_err(|e| format!("scan_all failed: {}", e))?;
+    let mut plan: Vec<(RowId, Vec<Value>)> = Vec::new();
+    for (row_id, record) in &scanned {
+        let old_vals = decode_row(&table, record)?;
+        if let Some(f) = &filter {
+            if !eval_expr(f, &all_col_names, &old_vals)? {
+                continue;
+            }
+        }
+        let mut new_vals = old_vals.clone();
+        for (idx, expr) in &set_items {
+            // 右边一律用"改之前的旧行"求值（标准语义：SET a = b, b = a 是交换，不是级联）
+            new_vals[*idx] = eval_scalar(expr, &all_col_names, &old_vals)?;
+        }
+        plan.push((*row_id, new_vals));
+    }
+    if plan.is_empty() {
+        return Ok(ResultSet::Affected(0));
+    }
+
+    // ③ 先按 schema 编码成 Row（类型/长度错误在这一步暴露），再预检唯一键
+    let mut rows: Vec<(RowId, Row)> = Vec::with_capacity(plan.len());
+    for (row_id, new_vals) in &plan {
+        let mut builder = table.new_row();
+        for (i, v) in new_vals.iter().enumerate() {
+            builder = match (&table.columns[i].col_type, v) {
+                (ColumnType::Int, Value::Int(n)) => builder
+                    .put_int(*n as u32)
+                    .map_err(|e| format!("column '{}': {}", all_col_names[i], e))?,
+                (ColumnType::Varchar(_), Value::Str(s)) => builder
+                    .put_varchar(s)
+                    .map_err(|e| format!("column '{}': {}", all_col_names[i], e))?,
+                (_, other) => {
+                    return Err(format!("type mismatch on column '{}': got {:?}", all_col_names[i], other));
+                }
+            };
+        }
+        let row = builder.build().map_err(|e| format!("build row failed: {}", e))?;
+        rows.push((*row_id, row));
+    }
+    check_update_unique_keys(&table, &plan)?;
+
+    // ④ 真正落盘：删旧 + 插新。两步都挂在同一条事务链上，ROLLBACK 能整体还原
+    let count = rows.len();
+    for (row_id, row) in rows {
+        table.delete(row_id, db.txn_mgr(), session.txn_id)
+            .map_err(|e| format!("delete old row failed: {}", e))?;
+        db.insert_in_txn(&mut table, row, session.txn_id)
+            .map_err(|e| format!("insert new row failed: {}", e))?;
+    }
+
+    Ok(ResultSet::Affected(count))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -334,8 +480,20 @@ mod tests {
         execute(stmt, db, session)
     }
 
+    /// 所有 e2e 测试共用 ./data/db.db，并行跑会互相删文件（Invalid magic: got 0x00000000）。
+    /// 拿一把全局锁把"开库→建表→断言→关库"整段串起来，比给每个测试造一套路径简单得多。
+    /// 用 `let _guard = db_lock();` 绑定到变量，守卫才会活到测试结束（`let _ =` 会立刻释放）。
+    fn db_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())  // 前一个测试 panic 不该连坐
+    }
+
     #[test]
     fn test_e2e_create_and_insert() {
+        let _guard = db_lock();
         let mut db = Database::open().unwrap();
         let mut session = Session::new();
 
@@ -366,6 +524,7 @@ mod tests {
 
     #[test]
     fn test_e2e_select_star() {
+        let _guard = db_lock();
         let _ = std::fs::remove_file(crate::config::DB_FILE);
         let _ = std::fs::remove_file(crate::config::LOG_FILE);
 
@@ -391,6 +550,7 @@ mod tests {
     }
     #[test]
     fn test_e2e_select_where_gt() {
+        let _guard = db_lock();
         let _ = std::fs::remove_file(crate::config::DB_FILE);
         let _ = std::fs::remove_file(crate::config::LOG_FILE);
 
@@ -416,6 +576,7 @@ mod tests {
 
     #[test]
     fn test_e2e_select_where_and_like() {
+        let _guard = db_lock();
         let _ = std::fs::remove_file(crate::config::DB_FILE);
         let _ = std::fs::remove_file(crate::config::LOG_FILE);
 
@@ -443,6 +604,7 @@ mod tests {
 
     #[test]
     fn test_select_unknown_column_errors() {
+        let _guard = db_lock();
         let _ = std::fs::remove_file(crate::config::DB_FILE);
         let _ = std::fs::remove_file(crate::config::LOG_FILE);
 
@@ -460,6 +622,7 @@ mod tests {
     }
     #[test]
     fn test_e2e_select_projection() {
+        let _guard = db_lock();
         let _ = std::fs::remove_file(crate::config::DB_FILE);
         let _ = std::fs::remove_file(crate::config::LOG_FILE);
 
@@ -493,6 +656,7 @@ mod tests {
     }
     #[test]
     fn test_e2e_delete() {
+        let _guard = db_lock();
         let _ = std::fs::remove_file(crate::config::DB_FILE);
         let _ = std::fs::remove_file(crate::config::LOG_FILE);
 
@@ -521,6 +685,7 @@ mod tests {
     }
     #[test]
     fn test_e2e_begin_commit() {
+        let _guard = db_lock();
         let _ = std::fs::remove_file(crate::config::DB_FILE);
         let _ = std::fs::remove_file(crate::config::LOG_FILE);
         let mut db = Database::open().unwrap();
@@ -543,6 +708,7 @@ mod tests {
 
     #[test]
     fn test_e2e_rollback_undoes_insert() {
+        let _guard = db_lock();
         let _ = std::fs::remove_file(crate::config::DB_FILE);
         let _ = std::fs::remove_file(crate::config::LOG_FILE);
         let mut db = Database::open().unwrap();
@@ -565,6 +731,7 @@ mod tests {
     }
     #[test]
     fn test_e2e_rollback_undoes_delete() {
+        let _guard = db_lock();
         let _ = std::fs::remove_file(crate::config::DB_FILE);
         let _ = std::fs::remove_file(crate::config::LOG_FILE);
         let mut db = Database::open().unwrap();
@@ -585,6 +752,150 @@ mod tests {
             }
             other => panic!("got {:?}", other),
         }
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_update_where() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE u_emp (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO u_emp VALUES (1, 20, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO u_emp VALUES (2, 17, 'Bob')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO u_emp VALUES (3, 25, 'Carter')").unwrap();
+
+        // 只改一行：id = 1 同时改两列
+        let r = exec_sql(&mut db, &mut session,
+                         "UPDATE u_emp SET name = 'Alicia', age = 21 WHERE id = 1").unwrap();
+        assert!(matches!(r, ResultSet::Affected(1)), "got {:?}", r);
+
+        match exec_sql(&mut db, &mut session, "SELECT * FROM u_emp ORDER BY id").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3, "UPDATE 不能改变行数");
+                assert_eq!(rows[0], vec!["1".to_string(), "21".to_string(), "Alicia".to_string()]);
+                assert_eq!(rows[1], vec!["2".to_string(), "17".to_string(), "Bob".to_string()]);
+                assert_eq!(rows[2], vec!["3".to_string(), "25".to_string(), "Carter".to_string()]);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // 没命中任何行 → 影响 0 行
+        let r = exec_sql(&mut db, &mut session, "UPDATE u_emp SET age = 99 WHERE id = 404").unwrap();
+        assert!(matches!(r, ResultSet::Affected(0)), "got {:?}", r);
+
+        // 列名写错 → 报错，并且不影响已有数据
+        let err = exec_sql(&mut db, &mut session, "UPDATE u_emp SET ghost = 1").unwrap_err();
+        assert!(err.contains("not found"), "got: {}", err);
+
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_update_rollback() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE ur_emp (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO ur_emp VALUES (1, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO ur_emp VALUES (2, 'Bob')").unwrap();
+
+        exec_sql(&mut db, &mut session, "BEGIN").unwrap();
+        exec_sql(&mut db, &mut session, "UPDATE ur_emp SET name = 'Zed' WHERE id = 1").unwrap();
+
+        // 事务里看得到新值
+        match exec_sql(&mut db, &mut session, "SELECT name FROM ur_emp WHERE id = 1").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], "Zed"),
+            other => panic!("got {:?}", other),
+        }
+
+        exec_sql(&mut db, &mut session, "ROLLBACK").unwrap();
+        assert!(session.txn_id.is_none());
+
+        // 回滚后：旧值回来，行数不变
+        match exec_sql(&mut db, &mut session, "SELECT * FROM ur_emp ORDER BY id").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "UPDATE 回滚后行数不能变");
+                assert_eq!(rows[0], vec!["1".to_string(), "Alice".to_string()]);
+                assert_eq!(rows[1], vec!["2".to_string(), "Bob".to_string()]);
+            }
+            other => panic!("got {:?}", other),
+        }
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_select_order_by() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE o_emp (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO o_emp VALUES (3, 25, 'Carter')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO o_emp VALUES (1, 20, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO o_emp VALUES (2, 20, 'Bob')").unwrap();
+
+        // 单列升序（默认）
+        match exec_sql(&mut db, &mut session, "SELECT id FROM o_emp ORDER BY id").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows, vec![
+                    vec!["1".to_string()],
+                    vec!["2".to_string()],
+                    vec!["3".to_string()],
+                ]);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // 降序
+        match exec_sql(&mut db, &mut session, "SELECT id FROM o_emp ORDER BY id DESC").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows, vec![
+                    vec!["3".to_string()],
+                    vec!["2".to_string()],
+                    vec!["1".to_string()],
+                ]);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // 多列：age 升序，age 相同再按 name 降序
+        match exec_sql(&mut db, &mut session,
+                       "SELECT name FROM o_emp ORDER BY age ASC, name DESC").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows, vec![
+                    vec!["Bob".to_string()],
+                    vec!["Alice".to_string()],
+                    vec!["Carter".to_string()],
+                ]);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // ORDER BY 用不在 SELECT 列表里的列 → 允许（排序在投影之前）
+        match exec_sql(&mut db, &mut session, "SELECT name FROM o_emp ORDER BY id DESC").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows, vec![
+                    vec!["Carter".to_string()],
+                    vec!["Bob".to_string()],
+                    vec!["Alice".to_string()],
+                ]);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // 排序列不存在 → 报错
+        let err = exec_sql(&mut db, &mut session, "SELECT * FROM o_emp ORDER BY ghost").unwrap_err();
+        assert!(err.contains("not found"), "got: {}", err);
+
         let _ = db.shutdown();
     }
 }

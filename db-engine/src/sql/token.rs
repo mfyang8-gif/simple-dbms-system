@@ -11,7 +11,7 @@ pub enum Token {
     Create, Table, Drop,
     And, Or, Not, Like,
     Join, On,
-    Group, By,
+    Group, By, Order, Asc, Desc,
     Begin, Commit, Rollback,
     Int, Varchar, Primary, Key, Null, As, Distinct,
     // 聚合函数

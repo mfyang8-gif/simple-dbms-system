@@ -29,6 +29,7 @@ impl Parser {
         match self.peek().clone() {
             Token::Select  => self.parse_select(),
             Token::Insert  => self.parse_insert(),
+            Token::Update  => self.parse_update(),
             Token::Delete  => self.parse_delete(),
             Token::Create  => self.parse_create_table(),
             Token::Drop    => self.parse_drop_table(),
@@ -78,10 +79,57 @@ impl Parser {
         let table = self.expect_ident()?;
         // filter = None (先不做 WHERE)
         let filter = self.parse_where()?;
+        // ORDER BY（可选，支持多列 + ASC/DESC）
+        let order_by = self.parse_order_by()?;
         // joins = vec![], group_by = vec![]
         // Ok(Statement::Select { ... })
-        Ok(Statement::Select { columns, table, filter, joins: vec![], group_by: vec![] })
+        Ok(Statement::Select { columns, table, filter, joins: vec![], group_by: vec![], order_by })
 
+    }
+
+    /// 解析 ORDER BY col [ASC|DESC] [, col ...]；没有则返回空 vec
+    fn parse_order_by(&mut self) -> Result<Vec<OrderByItem>, String> {
+        let mut items = Vec::new();
+        if self.peek() != &Token::Order {
+            return Ok(items);
+        }
+        self.advance();              // ORDER
+        self.expect(&Token::By)?;    // BY
+
+        loop {
+            let column = self.expect_ident()?;
+            let asc = match self.peek() {
+                Token::Asc  => { self.advance(); true }
+                Token::Desc => { self.advance(); false }
+                _ => true,           // 默认升序
+            };
+            items.push(OrderByItem { column, asc });
+
+            if self.peek() != &Token::Comma { break; }
+            self.advance();
+        }
+        Ok(items)
+    }
+
+    /// UPDATE <table> SET col = value [, col = value ...] [WHERE ...]
+    fn parse_update(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Update)?;
+        let table = self.expect_ident()?;
+        self.expect(&Token::Set)?;
+
+        let mut assignments = Vec::new();
+        loop {
+            let column = self.expect_ident()?;
+            self.expect(&Token::Eq)?;
+            let value = self.parse_primary()?;
+            assignments.push((column, value));
+
+            if self.peek() != &Token::Comma { break; }
+            self.advance();
+        }
+
+        let filter = self.parse_where()?;
+        Ok(Statement::Update { table, assignments, filter })
     }
 
     fn parse_insert(&mut self) -> Result<Statement, String> {
@@ -302,6 +350,7 @@ mod tests {
             filter: None,
             joins: vec![],
             group_by: vec![],
+            order_by: vec![],
         });
     }
 
@@ -317,6 +366,7 @@ mod tests {
             filter: None,
             joins: vec![],
             group_by: vec![],
+            order_by: vec![],
         });
     }
 
@@ -335,6 +385,7 @@ mod tests {
             filter: None,
             joins: vec![],
             group_by: vec![],
+            order_by: vec![],
         });
     }
 
@@ -427,6 +478,36 @@ mod tests {
                 assert!(!columns[1].primary_key);
             }
             other => panic!("expected CreateTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_update_with_where() {
+        let s = parse_sql("UPDATE users SET name = 'Bob', age = 20 WHERE id = 1").unwrap();
+        match s {
+            Statement::Update { table, assignments, filter } => {
+                assert_eq!(table, "users");
+                assert_eq!(assignments, vec![
+                    ("name".to_string(), Expr::Literal(LitValue::Str("Bob".into()))),
+                    ("age".to_string(), Expr::Literal(LitValue::Number(20))),
+                ]);
+                assert!(matches!(filter, Some(Expr::BinOp { op: BinOp::Eq, .. })));
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_order_by_multiple() {
+        let s = parse_sql("SELECT * FROM t ORDER BY a DESC, b").unwrap();
+        match s {
+            Statement::Select { order_by, .. } => {
+                assert_eq!(order_by, vec![
+                    OrderByItem { column: "a".into(), asc: false },
+                    OrderByItem { column: "b".into(), asc: true },
+                ]);
+            }
+            other => panic!("expected Select, got {:?}", other),
         }
     }
 }

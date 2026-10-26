@@ -25,6 +25,7 @@ pub enum Statement {
         joins: Vec<JoinClause>,
         filter: Option<Expr>,
         group_by: Vec<String>,
+        order_by: Vec<OrderByItem>,
     },
     /// UPDATE users SET name = 'Bob' WHERE id = 1
     Update {
@@ -56,6 +57,13 @@ pub enum SelectItem {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggFunc {
     Sum, Count, Avg, Min, Max,
+}
+
+/// ORDER BY 的一项：列名 + 方向
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderByItem {
+    pub column: String,
+    pub asc: bool,   // true = ASC（默认），false = DESC
 }
 
 /// JOIN 子句
