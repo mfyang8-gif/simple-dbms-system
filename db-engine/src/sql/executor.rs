@@ -85,30 +85,39 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
             execute_create_table(name, columns, db)
         }
         Statement::DropTable { name } => execute_drop_table(name, db),
-        Statement::Insert { table, columns, values } => execute_insert(table, columns, values, db),
+        Statement::Insert { table, columns, values } => execute_insert(table, columns, values, db, session),
         Statement::Select { columns, table, filter, .. } => execute_select(columns, table, filter, db),
-        Statement::Delete { table, filter } => execute_delete(table, filter, db),
+        Statement::Delete { table, filter } => execute_delete(table, filter, db, session),
         Statement::Begin => {
-            // 调 TM.begin，把 txn_id 塞进 session
-            todo!()
+            // 已在事务中 → 报错，防止嵌套
+            if session.txn_id.is_some() {
+                return Err("transaction already in progress".into());
+            }
+            let (txn_id, _begin_lsn) = db.txn_mgr().lock().unwrap().begin();
+            session.txn_id = Some(txn_id);
+            Ok(ResultSet::Ok)
         }
         Statement::Commit => {
-            todo!()
+            let txn_id = session.txn_id.ok_or("no transaction in progress")?;
+            // commit 内部已 flush 到 Commit LSN → 提交即持久
+            db.txn_mgr().lock().unwrap().commit(txn_id);
+            session.txn_id = None;
+            Ok(ResultSet::Ok)
         }
         Statement::Rollback => {
-            todo!()
+            // 第一刀：诚实拒绝。不 abort、不清 session —— 事务仍在，客户端可继续或 COMMIT
+            Err("ROLLBACK not supported yet (runtime undo lands in the next slice)".into())
         }
         Statement::Update { .. } => Err("UPDATE not yet implemented".into()),
     }
 }
 
 
-
 fn execute_drop_table(name: String, db: &mut Database) -> Result<ResultSet, String> {
     db.drop_table(&name).map_err(|e| format!("drop_table failed: {}", e))?;
     Ok(ResultSet::Ok)
 }
-fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, db: &mut Database) -> Result<ResultSet, String> {
+fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, db: &mut Database, session: &mut Session) -> Result<ResultSet, String> {
     // 1. 打开表（拿到 schema）
     let mut table = db.open_table(&table_name)
         .map_err(|e| format!("open_table failed: {}", e))?;
@@ -130,7 +139,7 @@ fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, d
                 builder = builder.put_int(n as u32);
             }
             (ColumnType::Varchar(_), Expr::Literal(LitValue::Str(s))) => {
-                // 关键：put_varchar 返回 Result<Self>，必须 ? 剥壳
+                // put_varchar 返回 Result<Self>，必须 ? 剥壳
                 builder = builder.put_varchar(&s)
                     .map_err(|e| format!("varchar failed: {}", e))?;
             }
@@ -141,11 +150,11 @@ fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, d
     }
     let row = builder.build();
 
-    // 5. 调存储层
-    db.insert(&mut table, row).map_err(|e| format!("insert failed: {}", e))?;
+    // 5. 调存储层（session 有事务 → 加入该事务；否则自动提交）
+    db.insert_in_txn(&mut table, row, session.txn_id)
+        .map_err(|e| format!("insert failed: {}", e))?;
     Ok(ResultSet::Affected(1))
 }
-
 // 评估标量表达式（列名查表 → 下标 → 从当前行取值）
 fn eval_scalar(e: &Expr, col_names: &[String], vals: &[Value]) -> Result<Value, String> {
     match e {
@@ -272,12 +281,15 @@ fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<E
     Ok(ResultSet::Rows { columns: out_col_names, rows })
 }
 // 删除表中所有行
-fn execute_delete(t: String, f: Option<Expr>, db: &mut Database) -> Result<ResultSet, String> {
+fn execute_delete(t: String, f: Option<Expr>, db: &mut Database, session: &mut Session) -> Result<ResultSet, String> {
     let mut table = db.open_table(&t)
-    .map_err(|e| format!("open_table failed: {}", e))?;
+        .map_err(|e| format!("open_table failed: {}", e))?;
+
     // 全列名（schema 顺序）
     let all_col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let out_rows = table.scan_all().map_err(|e| format!("scan_all failed: {}", e))?;
+
+    // 先收集命中的 RowId（决定与执行分离）
     let mut row_ids = Vec::new();
     for (row_id, record) in &out_rows {
         let vals = decode_row(&table, record)?;
@@ -285,22 +297,16 @@ fn execute_delete(t: String, f: Option<Expr>, db: &mut Database) -> Result<Resul
             if !eval_expr(f, &all_col_names, &vals)? {
                 continue;
             }
-
         }
-        { row_ids.push(*row_id); }
-
-
+        row_ids.push(*row_id);
     }
 
-    let count = row_ids.len();      // ← 注意：要在 row_ids 被 for 循环消耗掉之前拿 len
-
+    let count = row_ids.len();
     for row_id in row_ids {
-        table.delete(row_id, db.txn_mgr())
+        table.delete(row_id, db.txn_mgr(), session.txn_id)
             .map_err(|e| format!("delete failed: {}", e))?;
     }
     Ok(ResultSet::Affected(count))
-
-
 }
 
 
@@ -501,4 +507,41 @@ mod tests {
         }
         let _ = db.shutdown();
     }
+    #[test]
+    fn test_e2e_begin_commit() {
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE t_emp (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
+        exec_sql(&mut db, &mut session, "BEGIN").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO t_emp VALUES (1, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO t_emp VALUES (2, 'Bob')").unwrap();
+        assert!(session.txn_id.is_some());
+        exec_sql(&mut db, &mut session, "COMMIT").unwrap();
+        assert!(session.txn_id.is_none());
+
+        match exec_sql(&mut db, &mut session, "SELECT * FROM t_emp").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            other => panic!("got {:?}", other),
+        }
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_rollback_rejected_for_now() {
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE t_emp2 (id INT PRIMARY KEY)").unwrap();
+        exec_sql(&mut db, &mut session, "BEGIN").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO t_emp2 VALUES (1)").unwrap();
+        let err = exec_sql(&mut db, &mut session, "ROLLBACK").unwrap_err();
+        assert!(err.contains("not supported"), "got: {}", err);
+        let _ = db.shutdown();
+    }
+
 }

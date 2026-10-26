@@ -52,9 +52,13 @@ impl Database {
     }
 
     pub fn insert(&mut self, table: &mut Table, row: crate::row::Row) -> std::io::Result<crate::types::RowId> {
-        table.insert_row(row, &mut self.free_mgr, &mut self.catalog, &self.txn_mgr)
+        self.insert_in_txn(table, row, None)
     }
 
+    /// 事务感知插入：txn = Some(id) 表示加入调用方的显式事务
+    pub fn insert_in_txn(&mut self, table: &mut Table, row: crate::row::Row, txn: Option<crate::recovery::log_record::TxnId>) -> std::io::Result<crate::types::RowId> {
+        table.insert_row(row, &mut self.free_mgr, &mut self.catalog, &self.txn_mgr, txn)
+    }
     /// 首次创建：初始化所有系统页
     fn init_new(buffer_pool: Arc<BufferPool>, log_manager: Arc<LogManager>) -> std::io::Result<Self> {
         let txn_mgr = Arc::new(Mutex::new(TransactionManager::new(log_manager.clone())));

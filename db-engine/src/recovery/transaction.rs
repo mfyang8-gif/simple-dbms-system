@@ -79,7 +79,16 @@ impl TransactionManager {
 
     }
 
+    pub fn last_lsn(&self, txn_id: TxnId) -> Lsn {
+        self.active.get(&txn_id).map(|t| t.last_lsn).unwrap_or(INVALID_LSN)
+    }
 
+    /// 一条语句结束后，把 WalContext 推进后的 last_lsn 写回事务表
+    pub fn set_last_lsn(&mut self, txn_id: TxnId, lsn: Lsn) {
+        if let Some(t) = self.active.get_mut(&txn_id) {
+            t.last_lsn = lsn;
+        }
+    }
 
 }
 

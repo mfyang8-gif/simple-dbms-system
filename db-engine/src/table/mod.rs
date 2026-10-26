@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::collections::HashMap;
 use crate::recovery::transaction::TransactionManager;
+use crate::recovery::log_record::TxnId;
+use crate::recovery::lsn::Lsn;
 use std::sync::Mutex;
 use crate::record::Record;
 use crate::row::{Row, RowBuilder};
@@ -10,7 +12,6 @@ use crate::storage::free_page_manager::FreePageManager;
 use crate::storage::page_header::PageHeader;
 use crate::storage::page_ops;
 use crate::types::{PageId, RowId};
-
 // ★ [Slice B 修改] 新增：自动提交事务 id。
 //   Slice B 暂无事务管理器，每条语句用固定 id；Phase 3 会替换为真实 txn_id。
 
@@ -563,13 +564,13 @@ impl Table {
     pub fn new_row(&self) -> TypedRowBuilder<'_> { TypedRowBuilder::new(&self.columns) }
 
     /// 高层插入接口：带有完整的约束校验与自增填充
-    pub fn insert_row(&mut self, row: Row, free_mgr: &mut FreePageManager, catalog: &mut crate::catalog::Catalog, txn_mgr: &Arc<Mutex<TransactionManager>>) -> std::io::Result<RowId> {
+    pub fn insert_row(&mut self, row: Row, free_mgr: &mut FreePageManager, catalog: &mut crate::catalog::Catalog, txn_mgr: &Arc<Mutex<TransactionManager>>, txn: Option<TxnId>) -> std::io::Result<RowId> {
         let filled_row = self.fill_auto_increment(row)?;
         self.check_unique_constraints(&filled_row)?;
         self.evaluate_check_constraints(&filled_row)?;
         let record = filled_row.to_record()?;
 
-        self.insert_raw(&record, free_mgr, catalog, txn_mgr)
+        self.insert_raw(&record, free_mgr, catalog, txn_mgr, txn)
     }
 
     fn fill_auto_increment(&mut self, row: Row) -> std::io::Result<Row> {
@@ -663,18 +664,32 @@ impl Table {
         Ok(values)
     }
 
+    fn finish_stmt(txn_mgr: &Arc<Mutex<TransactionManager>>, txn_id: TxnId, lsn: Lsn, auto_commit: bool) {
+        let mut tm = txn_mgr.lock().unwrap();
+        if auto_commit {
+            tm.commit(txn_id);
+        } else {
+            tm.set_last_lsn(txn_id, lsn);
+        }
+    }
+
     /// 纯底层插入，绕过所有校验逻辑（内部使用）
-    pub fn insert_raw(&mut self, record: &Record, free_mgr: &mut FreePageManager, catalog: &mut crate::catalog::Catalog, txn_mgr: &Arc<Mutex<TransactionManager>>) -> std::io::Result<RowId> {
-        // ① 向共享 TM 开事务：拿 (id, begin_lsn) 的瞬间即放锁（绝不持锁做 IO）
-        let (txn_id, begin_lsn) = { txn_mgr.lock().unwrap().begin() };
-        // ② 用 TM 发好的号起“本条语句的 Update 游标”，不再自造 txn_id
-        let mut wal = page_ops::WalContext::with_txn(self.buffer_pool.log_manager().clone(), txn_id, begin_lsn);
+    pub fn insert_raw(&mut self, record: &Record, free_mgr: &mut FreePageManager, catalog: &mut crate::catalog::Catalog, txn_mgr: &Arc<Mutex<TransactionManager>>, txn: Option<TxnId>) -> std::io::Result<RowId> {
+        // ① 事务上下文：显式事务用外层 id 续链；否则自己开（自动提交）
+        let (txn_id, start_lsn, auto_commit) = match txn {
+            Some(id) => (id, txn_mgr.lock().unwrap().last_lsn(id), false),
+            None => {
+                let (id, lsn) = txn_mgr.lock().unwrap().begin();
+                (id, lsn, true)
+            }
+        };
+        let mut wal = page_ops::WalContext::with_txn(self.buffer_pool.log_manager().clone(), txn_id, start_lsn);
 
         let last_page = *self.data_pages.last().unwrap();
         let page_ref = self.buffer_pool.fetch_page(last_page)?;
         if let Some(slot) = page_ops::insert_record(&mut page_ref.write().unwrap(), record, &mut wal) {
             self.record_count += 1;
-            txn_mgr.lock().unwrap().commit(txn_id);
+            Self::finish_stmt(txn_mgr, txn_id, wal.last_lsn(), auto_commit);
             return Ok(RowId::new(last_page, slot));
         }
 
@@ -691,23 +706,33 @@ impl Table {
                 self.page_count += 1;
                 self.data_pages.push(new_page_id);
                 catalog.update_table_meta(&self.name, self.page_count, self.record_count, self.data_pages.clone(), free_mgr)?;
-                txn_mgr.lock().unwrap().commit(txn_id);
+                Self::finish_stmt(txn_mgr, txn_id, wal.last_lsn(), auto_commit);
                 return Ok(RowId::new(new_page_id, slot));
             }
         }
 
-        // ③ 两次都插失败：声明该事务作废（写 Abort + 从 active 摘除）
-        txn_mgr.lock().unwrap().abort(txn_id);
+        // ③ 两次都失败：自动提交模式声明事务作废；显式事务只续链，不终止整个事务
+        if auto_commit {
+            txn_mgr.lock().unwrap().abort(txn_id);
+        } else {
+            txn_mgr.lock().unwrap().set_last_lsn(txn_id, wal.last_lsn());
+        }
         Err(std::io::Error::new(std::io::ErrorKind::Other, "Insert failed"))
     }
-
     pub fn read(&self, row_id: RowId) -> std::io::Result<Record> {
         page_ops::read_record(&self.buffer_pool.fetch_page(row_id.page_id)?.read().unwrap(), row_id.slot_id)
     }
 
-    pub fn delete(&mut self, row_id: RowId, txn_mgr: &Arc<Mutex<TransactionManager>>) -> std::io::Result<()> {
-        let (txn_id, begin_lsn) = { txn_mgr.lock().unwrap().begin() };
-        let mut wal = page_ops::WalContext::with_txn(self.buffer_pool.log_manager().clone(), txn_id, begin_lsn);
+    pub fn delete(&mut self, row_id: RowId, txn_mgr: &Arc<Mutex<TransactionManager>>, txn: Option<TxnId>) -> std::io::Result<()> {
+        // 事务上下文：显式事务续链；否则自动提交
+        let (txn_id, start_lsn, auto_commit) = match txn {
+            Some(id) => (id, txn_mgr.lock().unwrap().last_lsn(id), false),
+            None => {
+                let (id, lsn) = txn_mgr.lock().unwrap().begin();
+                (id, lsn, true)
+            }
+        };
+        let mut wal = page_ops::WalContext::with_txn(self.buffer_pool.log_manager().clone(), txn_id, start_lsn);
 
         let result = page_ops::delete_record(
             &mut self.buffer_pool.fetch_page(row_id.page_id)?.write().unwrap(),
@@ -717,16 +742,19 @@ impl Table {
         match result {
             Ok(()) => {
                 self.record_count = self.record_count.saturating_sub(1);
-                txn_mgr.lock().unwrap().commit(txn_id);
+                Self::finish_stmt(txn_mgr, txn_id, wal.last_lsn(), auto_commit);
                 Ok(())
             }
             Err(e) => {
-                txn_mgr.lock().unwrap().abort(txn_id);
+                if auto_commit {
+                    txn_mgr.lock().unwrap().abort(txn_id);
+                } else {
+                    txn_mgr.lock().unwrap().set_last_lsn(txn_id, wal.last_lsn());
+                }
                 Err(e)
             }
         }
     }
-
     pub fn scan_all(&self) -> std::io::Result<Vec<(RowId, Record)>> {
         let mut results = Vec::new();
         for &page_id in &self.data_pages {
