@@ -1,30 +1,24 @@
 use db_engine::database::Database;
-use db_engine::table::Column;
+use db_engine::server::{run_repl, run_server};
 
 fn main() -> std::io::Result<()> {
-    let mut db = Database::open()?;
-    println!("=== Mini DBMS Engine Ready ===");
+    let mut args = std::env::args().skip(1);
 
-    // 建表
-    let mut table = db.create_table("users", vec![
-        Column::int("id").not_null().auto_increment(),
-        Column::varchar("name", 50).not_null(),
-        Column::int("age").check("age >= 0"),
-    ])?;
-    println!("Created table: {}", table);
-
-    // 插入
-    let row = table.new_row()
-        .put_int(0)?
-        .put_varchar("Alice")?
-        .put_int(25)?
-        .build()?;
-    let row_id = db.insert(&mut table, row)?;
-    println!("Inserted: {}", row_id);
-
-    // 关闭
-    db.shutdown()?;
-    println!("Database closed.");
-    Ok(())
+    match args.next().as_deref() {
+        Some("--repl") => {
+            let mut db = Database::open()?;
+            run_repl(&mut db);
+            db.shutdown()?;
+            println!("Bye.");
+            Ok(())
+        }
+        Some(addr) => {
+            let db = Database::open()?;
+            run_server(db, addr)
+        }
+        None => {
+            let db = Database::open()?;
+            run_server(db, "127.0.0.1:9000")
+        }
+    }
 }
-

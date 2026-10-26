@@ -400,10 +400,33 @@ mod tests {
     }
     #[test] fn test_insert_full() {
         let s = parse_sql("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
-        // 验证 columns=["id","name"], values=[Literal(Number(1)), Literal(Str("Alice"))]
+        match s {
+            Statement::Insert { table, columns, values } => {
+                assert_eq!(table, "users");
+                assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
+                assert_eq!(values, vec![
+                    Expr::Literal(LitValue::Number(1)),
+                    Expr::Literal(LitValue::Str("Alice".to_string())),
+                ]);
+            }
+            other => panic!("expected Insert, got {:?}", other),
+        }
     }
+
     #[test] fn test_create_table() {
         let s = parse_sql("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
-        // 验证 columns.len()==2, columns[0].primary_key==true
+        match s {
+            Statement::CreateTable { name, columns } => {
+                assert_eq!(name, "users");
+                assert_eq!(columns.len(), 2);
+                assert_eq!(columns[0].name, "id");
+                assert_eq!(columns[0].data_type, DataType::Int);
+                assert!(columns[0].primary_key);
+                assert_eq!(columns[1].name, "name");
+                assert_eq!(columns[1].data_type, DataType::Varchar(50));
+                assert!(!columns[1].primary_key);
+            }
+            other => panic!("expected CreateTable, got {:?}", other),
+        }
     }
 }
