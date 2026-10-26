@@ -108,6 +108,7 @@ impl Lexer {
                     "OR" => Ok(Token::Or),
                     "NOT" => Ok(Token::Not),
                     "LIKE" => Ok(Token::Like),
+                    "IS" => Ok(Token::Is),
                     "JOIN" => Ok(Token::Join),
                     "ON" => Ok(Token::On),
                     "GROUP" => Ok(Token::Group),
@@ -123,6 +124,8 @@ impl Lexer {
                     "PRIMARY" => Ok(Token::Primary),
                     "KEY" => Ok(Token::Key),
                     "NULL" => Ok(Token::Null),
+                    "UNIQUE" => Ok(Token::Unique),
+                    "DEFAULT" => Ok(Token::Default),
                     "AS" => Ok(Token::As),
                     "DISTINCT" => Ok(Token::Distinct),
                     _ => Ok(Token::Ident(s)),
@@ -252,6 +255,20 @@ mod tests {
                 Token::And,
                 Token::Ident("name".into()), Token::Like, Token::Str("%张%".into()),
                 Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn test_is_null_keywords() {
+        assert_eq!(
+            tokens("name IS NULL"),
+            vec![Token::Ident("name".into()), Token::Is, Token::Null, Token::Eof]
+        );
+        assert_eq!(
+            tokens("name IS NOT NULL"),
+            vec![
+                Token::Ident("name".into()), Token::Is, Token::Not, Token::Null, Token::Eof
             ]
         );
     }

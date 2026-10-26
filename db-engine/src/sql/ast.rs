@@ -81,6 +81,10 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub primary_key: bool,
     pub not_null: bool,
+    /// UNIQUE 约束（与主键互斥：主键已隐含唯一）
+    pub unique: bool,
+    /// DEFAULT 值；None = 没写 DEFAULT。目前只支持字面量（数字 / 字符串）
+    pub default: Option<LitValue>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +103,10 @@ pub enum Expr {
     And(Box<Expr>, Box<Expr>),                   // 逻辑与
     Or(Box<Expr>, Box<Expr>),                    // 逻辑或
     Like { expr: Box<Expr>, pattern: String },   // LIKE '%张%'
+    /// IS NULL / IS NOT NULL——NULL 参与比较永远是 unknown，只能这样单独判断
+    IsNull { expr: Box<Expr>, negated: bool },
+    /// NOT expr——取反；unknown 取反后仍是 unknown（三值逻辑）
+    Not(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

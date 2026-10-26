@@ -2,8 +2,12 @@
 
 use crate::config::{FILE_HEADER_SIZE, PAGE_SIZE};
 
-pub const FILE_HEADER_MAGIC: u32 = 0x4442_4D53;
-pub const FILE_HEADER_VERSION: u32 = 1;
+/// 文件格式魔数：v2 起行内新增 null bitmap（支持 NULL），与 v1 的 db.db 不兼容。
+/// 故意改魔数而不是加兼容分支——让老文件在 open 时就报错，而不是读数据时静默读出错值。
+/// 0x4442_4D54 = "DBMT"
+pub const FILE_HEADER_MAGIC: u32 = 0x4442_4D54;
+/// 行格式版本：1 = 无 NULL 支持；2 = 行首带 null bitmap
+pub const FILE_HEADER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct FileHeader {

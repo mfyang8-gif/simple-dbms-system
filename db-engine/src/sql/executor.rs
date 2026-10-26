@@ -2,11 +2,9 @@
 
 use crate::sql::ast::*;
 use crate::database::Database;
-use crate::table::{Column, ColumnType};
+use crate::table::{Column, ColumnType, DefaultVal};
 use crate::types::RowId;
 /// 执行结果：SELECT 返回行，其它语句返回受影响行数
-use crate::row::RowBuilder;
-// 你之前只 import 了 Column，加个 ColumnType
 use crate::record::Record;
 use crate::row::Row;
 use crate::table::Table;
@@ -14,7 +12,8 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 #[derive(Debug)]
 pub enum ResultSet {
-    Rows { columns: Vec<String>, rows: Vec<Vec<String>> },
+    /// None = SQL NULL（不能用空字符串代替，否则会把 NULL 当成 "" 输出）
+    Rows { columns: Vec<String>, rows: Vec<Vec<Option<String>>> },
     Affected(usize),
     Ok,
 }
@@ -31,19 +30,80 @@ fn ast_col_to_column(def: ColumnDef) -> Column {
     let mut c = base;
     if def.primary_key { c = c.primary_key(); }
     if def.not_null    { c = c.not_null(); }
+    if def.unique      { c = c.unique(); }
+    // DEFAULT 只存字面量：数字按 INT 默认、字符串按 VARCHAR 默认；
+    // 类型不匹配（如 INT 列 DEFAULT 'abc'）不在此拦截，写入时由存储层报错
+    if let Some(lit) = def.default {
+        c = match lit {
+            LitValue::Number(n) => c.default_int(n as u32),
+            LitValue::Str(s) => c.default_varchar(&s),
+            LitValue::Null => c,
+        };
+    }
     c
 }
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
     Int(i64),
     Str(String),
+    /// SQL 的“没值”：与空字符串、与 0 都不是一个东西
+    Null,
 }
 
 impl Value {
+    /// 人类可读形式（REPL / 错误信息用）
     fn to_string_readable(&self) -> String {
         match self {
             Value::Int(n) => n.to_string(),
             Value::Str(s) => s.clone(),
+            Value::Null => "NULL".to_string(),
+        }
+    }
+
+    /// 输出格：None 就是 NULL，到协议层才能区分“字符串 NULL”与“真的是 NULL”
+    fn to_cell(&self) -> Option<String> {
+        match self {
+            Value::Int(n) => Some(n.to_string()),
+            Value::Str(s) => Some(s.clone()),
+            Value::Null => None,
+        }
+    }
+}
+
+/// 三值逻辑：SQL 里 `NULL = 1` 不是 false 而是 unknown，
+/// 必须三值才算得对：`NULL OR TRUE` = TRUE，`NULL AND FALSE` = FALSE。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tri {
+    True,
+    False,
+    Unknown,
+}
+
+impl Tri {
+    fn and(self, other: Self) -> Self {
+        use Tri::*;
+        match (self, other) {
+            // 只要有一边确定 false，整体就是 false，unknown 管不住它
+            (False, _) | (_, False) => False,
+            (Unknown, _) | (_, Unknown) => Unknown,
+            (True, True) => True,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        use Tri::*;
+        match (self, other) {
+            (True, _) | (_, True) => True,
+            (Unknown, _) | (_, Unknown) => Unknown,
+            (False, False) => False,
+        }
+    }
+
+    fn not(self) -> Self {
+        match self {
+            Tri::True => Tri::False,
+            Tri::False => Tri::True,
+            Tri::Unknown => Tri::Unknown,
         }
     }
 }
@@ -51,16 +111,22 @@ impl Value {
 /// 按 schema 把一行字节解析成 Vec<Value>
 fn decode_row(table: &Table, record: &Record) -> Result<Vec<Value>, String> {
     let row = Row::from_record(record);
-    let mut cursor = row.cursor();
+    // 带列数校验：行里的位图长度对不上就报错，而不是把值字节当位图静默读
+    let mut cursor = row.cursor_with_cols(table.columns.len())
+        .map_err(|e| format!("decode row: {}", e))?;
     let mut vals = Vec::new();
     for col in &table.columns {
         let v = match &col.col_type {
-            ColumnType::Int => Value::Int(
-                cursor.get_int().map_err(|e| format!("decode col '{}': {}", col.name, e))? as i64,
-            ),
-            ColumnType::Varchar(_) => Value::Str(
-                cursor.get_varchar().map_err(|e| format!("decode col '{}': {}", col.name, e))?.to_string(),
-            ),
+            ColumnType::Int => match cursor.get_int_opt() {
+                Ok(Some(n)) => Value::Int(n as i64),
+                Ok(None) => Value::Null,
+                Err(e) => return Err(format!("decode col '{}': {}", col.name, e)),
+            },
+            ColumnType::Varchar(_) => match cursor.get_varchar_opt() {
+                Ok(Some(s)) => Value::Str(s.to_string()),
+                Ok(None) => Value::Null,
+                Err(e) => return Err(format!("decode col '{}': {}", col.name, e)),
+            },
         };
         vals.push(v);
     }
@@ -136,33 +202,52 @@ fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, d
     let mut table = db.open_table(&table_name)
         .map_err(|e| format!("open_table failed: {}", e))?;
 
-    // 2. 决定目标列（空 = 全部列）
-    let target_count = if columns.is_empty() { table.columns.len() } else { columns.len() };
+    // 2. 目标列：没给列表 = 全部列按 schema 顺序；给了列表就按列名找下标（允许乱序、允许只写一部分）
+    let targets: Vec<usize> = if columns.is_empty() {
+        (0..table.columns.len()).collect()
+    } else {
+        let names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+        columns.iter().map(|name| {
+            names.iter().position(|c| c == name)
+                .ok_or_else(|| format!("column '{}' not found in INSERT", name))
+        }).collect::<Result<Vec<usize>, String>>()?
+    };
 
-    // 3. 严格校验：值数量必须等于目标列数量
-    if values.len() != target_count {
-        return Err(format!("expected {} values, got {}", target_count, values.len()));
+    // 3. 严格校验：值数量必须等于目标列数量；重复列名不能默默后者覆盖前者
+    if values.len() != targets.len() {
+        return Err(format!("expected {} values, got {}", targets.len(), values.len()));
     }
-
-    // 4. 逐列构造 Row（Java 风 for 循环，不用 zip）
-    let mut builder = RowBuilder::new();
-    for (i, expr) in values.into_iter().enumerate() {
-        let col = &table.columns[i];
-        match (&col.col_type, expr) {
-            (ColumnType::Int, Expr::Literal(LitValue::Number(n))) => {
-                builder = builder.put_int(n as u32);
-            }
-            (ColumnType::Varchar(_), Expr::Literal(LitValue::Str(s))) => {
-                // put_varchar 返回 Result<Self>，必须 ? 剥壳
-                builder = builder.put_varchar(&s)
-                    .map_err(|e| format!("varchar failed: {}", e))?;
-            }
-            (_, other) => {
-                return Err(format!("type mismatch on column '{}': got {:?}", col.name, other));
-            }
+    let mut slot_of: Vec<Option<usize>> = vec![None; table.columns.len()];
+    for (v_idx, &col_idx) in targets.iter().enumerate() {
+        if slot_of[col_idx].is_some() {
+            return Err(format!("duplicate column '{}' in INSERT", table.columns[col_idx].name));
         }
+        slot_of[col_idx] = Some(v_idx);
     }
-    let row = builder.build();
+
+    // 4. 逐列构造 Row（按 schema 顺序走完每一列）：
+    //    没被点名的列：有 DEFAULT 就用默认值，没 DEFAULT 才写 NULL（能不能空交给 Table 层判）；
+    //    类型/长度/NOT NULL 校验全部下沉到 Table 层的 TypedRowBuilder
+    let mut builder = table.new_row();
+    for (i, col) in table.columns.iter().enumerate() {
+        builder = match slot_of[i] {
+            None => match &col.default_value {
+                Some(DefaultVal::Int(v)) => builder.put_int(*v),
+                Some(DefaultVal::Varchar(s)) => builder.put_varchar(s),
+                None => builder.put_null(),
+            },
+            Some(v_idx) => match &values[v_idx] {
+                Expr::Literal(LitValue::Number(n)) => builder.put_int(*n as u32),
+                Expr::Literal(LitValue::Str(s)) => builder.put_varchar(s),
+                Expr::Literal(LitValue::Null) => builder.put_null(),
+                other => {
+                    return Err(format!("type mismatch on column '{}': got {:?}", col.name, other));
+                }
+            },
+        }
+            .map_err(|e| e.to_string())?;
+    }
+    let row = builder.build().map_err(|e| format!("row build failed: {}", e))?;
 
     // 5. 调存储层（session 有事务 → 加入该事务；否则自动提交）
     db.insert_in_txn(&mut table, row, session.txn_id)
@@ -180,25 +265,29 @@ fn eval_scalar(e: &Expr, col_names: &[String], vals: &[Value]) -> Result<Value, 
         }
         Expr::Literal(LitValue::Number(n)) => Ok(Value::Int(*n)),
         Expr::Literal(LitValue::Str(s)) => Ok(Value::Str(s.clone())),
+        Expr::Literal(LitValue::Null) => Ok(Value::Null),
         other => Err(format!("unsupported scalar: {:?}", other)),
     }
 }
 
-/// 比较两个值（类型必须一致：Int 和 Int 比、Str 和 Str 比）
-fn compare(l: &Value, op: &BinOp, r: &Value) -> Result<bool, String> {
+/// 比较两个值。只要有一边是 NULL，结果就是 unknown（不是 false）。
+fn compare(l: &Value, op: &BinOp, r: &Value) -> Result<Tri, String> {
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(Tri::Unknown);
+    }
     let ord = match (l, r) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Str(a), Value::Str(b)) => a.cmp(b),
         _ => return Err(format!("cannot compare {:?} with {:?}", l, r)),
     };
-    Ok(match op {
+    Ok(Tri::from(match op {
         BinOp::Eq => ord == Ordering::Equal,
         BinOp::Neq => ord != Ordering::Equal,
         BinOp::Lt => ord == Ordering::Less,
         BinOp::Le => ord != Ordering::Greater,
         BinOp::Gt => ord == Ordering::Greater,
         BinOp::Ge => ord != Ordering::Less,
-    })
+    }))
 }
 
 /// LIKE 匹配（支持 % 通配符，双指针回溯法）
@@ -226,23 +315,54 @@ fn like_match(text: &str, pattern: &str) -> bool {
     pi == p.len()
 }
 
-/// 评估整个过滤表达式 → true/false（递归下降——和 Parser 的树一一对应）
-fn eval_expr(expr: &Expr, col_names: &[String], vals: &[Value]) -> Result<bool, String> {
+/// 评估整个过滤表达式 → Tri（递归下降——和 Parser 的树一一对应）
+fn eval_expr(expr: &Expr, col_names: &[String], vals: &[Value]) -> Result<Tri, String> {
     match expr {
         Expr::BinOp { left, op, right } => {
             let l = eval_scalar(left, col_names, vals)?;
             let r = eval_scalar(right, col_names, vals)?;
             compare(&l, op, &r)
         }
-        Expr::And(a, b) => Ok(eval_expr(a, col_names, vals)? && eval_expr(b, col_names, vals)?),
-        Expr::Or(a, b) => Ok(eval_expr(a, col_names, vals)? || eval_expr(b, col_names, vals)?),
+        Expr::And(a, b) => Ok(eval_expr(a, col_names, vals)?.and(eval_expr(b, col_names, vals)?)),
+        Expr::Or(a, b) => Ok(eval_expr(a, col_names, vals)?.or(eval_expr(b, col_names, vals)?)),
+        Expr::Not(a) => Ok(eval_expr(a, col_names, vals)?.not()),
         Expr::Like { expr, pattern } => {
             let v = eval_scalar(expr, col_names, vals)?;
-            Ok(like_match(&v.to_string_readable(), pattern))
+            // NULL LIKE 'x%' 也是 unknown
+            if matches!(v, Value::Null) {
+                return Ok(Tri::Unknown);
+            }
+            Ok(Tri::from(like_match(&v.to_string_readable(), pattern)))
+        }
+        Expr::IsNull { expr, negated } => {
+            // IS NULL 是唯一能把 NULL 判成真值的运算符，结果永远不是 unknown
+            let v = eval_scalar(expr, col_names, vals)?;
+            let is_null = matches!(v, Value::Null);
+            Ok(Tri::from(is_null != *negated))
         }
         other => Err(format!("unsupported filter expression: {:?}", other)),
     }
 }
+
+impl From<bool> for Tri {
+    fn from(b: bool) -> Self {
+        if b { Tri::True } else { Tri::False }
+    }
+}
+/// 排序专用比较：NULL 排最前（MySQL `ORDER BY asc` 的行为）。
+/// 类型不一致时按类型定序，保证排序全函数都有定义、不 panic。
+fn cmp_for_sort(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Int(_), Value::Str(_)) => Ordering::Less,
+        (Value::Str(_), Value::Int(_)) => Ordering::Greater,
+    }
+}
+
 fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<Expr>, order_by: Vec<OrderByItem>, db: &mut Database) -> Result<ResultSet, String> {
     let table = db.open_table(&table_name)
         .map_err(|e| format!("open_table failed: {}", e))?;
@@ -285,7 +405,8 @@ fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<E
     for (_row_id, record) in &out_rows {
         let vals = decode_row(&table, record)?;
         if let Some(f) = &filter {
-            if !eval_expr(f, &all_col_names, &vals)? {
+            // WHERE 只保留为 TRUE 的行：FALSE 和 UNKNOWN（ NULL 参与）都丢掉
+            if eval_expr(f, &all_col_names, &vals)? != Tri::True {
                 continue;
             }
         }
@@ -296,22 +417,18 @@ fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<E
     if !sort_keys.is_empty() {
         decoded.sort_by(|a, b| {
             for &(idx, asc) in &sort_keys {
-                let ord = match (&a[idx], &b[idx]) {
-                    (Value::Int(x), Value::Int(y)) => x.cmp(y),
-                    (Value::Str(x), Value::Str(y)) => x.cmp(y),
-                    _ => std::cmp::Ordering::Equal,
-                };
-                if ord != std::cmp::Ordering::Equal {
+                let ord = cmp_for_sort(&a[idx], &b[idx]);
+                if ord != Ordering::Equal {
                     return if asc { ord } else { ord.reverse() };
                 }
             }
-            std::cmp::Ordering::Equal
+            Ordering::Equal
         });
     }
 
-    // 投影（只取 proj 下标）
-    let rows: Vec<Vec<String>> = decoded.iter()
-        .map(|vals| proj.iter().map(|&i| vals[i].to_string_readable()).collect())
+    // 投影（只取 proj 下标）；NULL 以 None 输出，不能跟字符串 "NULL" 混为一谈
+    let rows: Vec<Vec<Option<String>>> = decoded.iter()
+        .map(|vals| proj.iter().map(|&i| vals[i].to_cell()).collect())
         .collect();
 
     // 输出的列名也只保留投影的
@@ -321,7 +438,7 @@ fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<E
 
     Ok(ResultSet::Rows { columns: out_col_names, rows })
 }
-// 删除表中所有行
+// 删除 WHERE 为 TRUE 的行（无 WHERE 时删全表）
 fn execute_delete(t: String, f: Option<Expr>, db: &mut Database, session: &mut Session) -> Result<ResultSet, String> {
     let mut table = db.open_table(&t)
         .map_err(|e| format!("open_table failed: {}", e))?;
@@ -335,7 +452,8 @@ fn execute_delete(t: String, f: Option<Expr>, db: &mut Database, session: &mut S
     for (row_id, record) in &out_rows {
         let vals = decode_row(&table, record)?;
         if let Some(f) = &f {
-            if !eval_expr(f, &all_col_names, &vals)? {
+            // 同样是"只删 WHERE 为 TRUE 的行"：age = NULL 的行不会被 DELETE ... WHERE age > 18 删掉
+            if eval_expr(f, &all_col_names, &vals)? != Tri::True {
                 continue;
             }
         }
@@ -350,8 +468,9 @@ fn execute_delete(t: String, f: Option<Expr>, db: &mut Database, session: &mut S
     Ok(ResultSet::Affected(count))
 }
 
-/// 唯一性预检：把"改完之后"的键集合算出来，检查新行之间、以及新行与"没被改的旧行"是否撞车。
+/// 唯一性预检：把"改完之后"每个唯一列的取值算出来，逐列检查新值之间、以及新值与"没被改的旧行"是否撞车。
 /// 必须在动任何数据之前跑完，否则删了旧行才发现冲突，表就残了。
+/// 与存储层 check_unique_constraints 一致：**逐列独立判定**，不能把多列当复合键。
 fn check_update_unique_keys(table: &Table, plan: &[(RowId, Vec<Value>)]) -> Result<(), String> {
     let unique_cols: Vec<usize> = table.columns.iter().enumerate()
         .filter(|(_, c)| c.primary_key || c.unique)
@@ -361,26 +480,33 @@ fn check_update_unique_keys(table: &Table, plan: &[(RowId, Vec<Value>)]) -> Resu
         return Ok(());
     }
 
-    let key_of = |vals: &[Value]| -> Vec<String> {
-        unique_cols.iter().map(|&i| vals[i].to_string_readable()).collect()
-    };
-
-    // ① 没被 UPDATE 碰到的行 → 它们的键继续被占用
     let changing: HashSet<RowId> = plan.iter().map(|(id, _)| *id).collect();
-    let mut taken: HashSet<Vec<String>> = HashSet::new();
+    // occupied[pos] = 该唯一列上已被占用的非 NULL 值（没被改的旧行 + 已排队的改后新行）
+    let mut occupied: Vec<HashSet<String>> = unique_cols.iter().map(|_| HashSet::new()).collect();
+
+    // ① 没被 UPDATE 碰到的行 → 它们的键继续被占用（含 NULL 的格不占，SQL 标准下 NULL 不冲突）
     for (row_id, record) in table.scan_all().map_err(|e| format!("scan_all failed: {}", e))? {
         if changing.contains(&row_id) {
             continue;
         }
-        taken.insert(key_of(&decode_row(table, &record)?));
+        let vals = decode_row(table, &record)?;
+        for (pos, &ci) in unique_cols.iter().enumerate() {
+            if let Some(s) = vals[ci].to_cell() {
+                occupied[pos].insert(s);
+            }
+        }
     }
 
-    // ② 新行逐个占坑，insert 失败 = 自己跟自己或跟旧行重复
+    // ② 新行逐列占坑，某列 insert 失败 = 自己跟自己或跟旧行重复
     for (_, new_vals) in plan {
-        if !taken.insert(key_of(new_vals)) {
-            let col = &table.columns[unique_cols[0]];
-            let kind = if col.primary_key { "PRIMARY KEY" } else { "UNIQUE" };
-            return Err(format!("Duplicate value for {} column '{}'", kind, col.name));
+        for (pos, &ci) in unique_cols.iter().enumerate() {
+            if let Some(s) = new_vals[ci].to_cell() {
+                if !occupied[pos].insert(s) {
+                    let col = &table.columns[ci];
+                    let kind = if col.primary_key { "PRIMARY KEY" } else { "UNIQUE" };
+                    return Err(format!("Duplicate value for {} column '{}'", kind, col.name));
+                }
+            }
         }
     }
     Ok(())
@@ -418,7 +544,7 @@ fn execute_update(
     for (row_id, record) in &scanned {
         let old_vals = decode_row(&table, record)?;
         if let Some(f) = &filter {
-            if !eval_expr(f, &all_col_names, &old_vals)? {
+            if eval_expr(f, &all_col_names, &old_vals)? != Tri::True {
                 continue;
             }
         }
@@ -433,22 +559,17 @@ fn execute_update(
         return Ok(ResultSet::Affected(0));
     }
 
-    // ③ 先按 schema 编码成 Row（类型/长度错误在这一步暴露），再预检唯一键
+    // ③ 先按 schema 编码成 Row（类型/长度/NOT NULL 错误在这一步暴露），再预检唯一键
     let mut rows: Vec<(RowId, Row)> = Vec::with_capacity(plan.len());
     for (row_id, new_vals) in &plan {
         let mut builder = table.new_row();
         for (i, v) in new_vals.iter().enumerate() {
-            builder = match (&table.columns[i].col_type, v) {
-                (ColumnType::Int, Value::Int(n)) => builder
-                    .put_int(*n as u32)
-                    .map_err(|e| format!("column '{}': {}", all_col_names[i], e))?,
-                (ColumnType::Varchar(_), Value::Str(s)) => builder
-                    .put_varchar(s)
-                    .map_err(|e| format!("column '{}': {}", all_col_names[i], e))?,
-                (_, other) => {
-                    return Err(format!("type mismatch on column '{}': got {:?}", all_col_names[i], other));
-                }
-            };
+            builder = match v {
+                Value::Int(n) => builder.put_int(*n as u32),
+                Value::Str(s) => builder.put_varchar(s),
+                Value::Null => builder.put_null(),   // SET col = NULL；列是 NOT NULL 会被 Table 层拒
+            }
+            .map_err(|e| format!("column '{}': {}", all_col_names[i], e))?;
         }
         let row = builder.build().map_err(|e| format!("build row failed: {}", e))?;
         rows.push((*row_id, row));
@@ -489,6 +610,22 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())  // 前一个测试 panic 不该连坐
+    }
+
+    /// 测试断言辅助：一个单元格 Option<String> → 可读字符串（NULL 就写成 "NULL"）。
+    /// 这样断言仍然能写成 `cell(&rows[0][2]) == "Alice"`，不用到处 `unwrap()`。
+    fn cell(c: &Option<String>) -> String {
+        c.clone().unwrap_or_else(|| "NULL".to_string())
+    }
+
+    /// 一行 Option<String> → 一行 String
+    fn cells(row: &[Option<String>]) -> Vec<String> {
+        row.iter().map(cell).collect()
+    }
+
+    /// 整个结果集 → String（NULL 显示为 "NULL"）
+    fn cells_all(rows: &[Vec<Option<String>>]) -> Vec<Vec<String>> {
+        rows.iter().map(|r| cells(r)).collect()
     }
 
     #[test]
@@ -540,8 +677,8 @@ mod tests {
             ResultSet::Rows { columns, rows } => {
                 assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
                 assert_eq!(rows.len(), 2);
-                assert_eq!(rows[0], vec!["1".to_string(), "Alice".to_string()]);
-                assert_eq!(rows[1], vec!["2".to_string(), "Bob".to_string()]);
+                assert_eq!(cells(&rows[0]), vec!["1".to_string(), "Alice".to_string()]);
+                assert_eq!(cells(&rows[1]), vec!["2".to_string(), "Bob".to_string()]);
             }
             other => panic!("expected Rows, got {:?}", other),
         }
@@ -566,8 +703,8 @@ mod tests {
         match r {
             ResultSet::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2);                     // Alice 和 Carter
-                assert_eq!(rows[0][2], "Alice".to_string());
-                assert_eq!(rows[1][2], "Carter".to_string());
+                assert_eq!(cell(&rows[0][2]), "Alice".to_string());
+                assert_eq!(cell(&rows[1][2]), "Carter".to_string());
             }
             other => panic!("expected Rows, got {:?}", other),
         }
@@ -594,8 +731,8 @@ mod tests {
         match r {
             ResultSet::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2);
-                assert_eq!(rows[0][2], "Alice".to_string());
-                assert_eq!(rows[1][2], "Alan".to_string());
+                assert_eq!(cell(&rows[0][2]), "Alice".to_string());
+                assert_eq!(cell(&rows[1][2]), "Alan".to_string());
             }
             other => panic!("expected Rows, got {:?}", other),
         }
@@ -640,7 +777,7 @@ mod tests {
         match r {
             ResultSet::Rows { columns, rows } => {
                 assert_eq!(columns, vec!["name".to_string()]);
-                assert_eq!(rows, vec![
+                assert_eq!(cells_all(&rows), vec![
                     vec!["Alice".to_string()],
                     vec!["Carter".to_string()],
                 ]);
@@ -677,7 +814,7 @@ mod tests {
         match r {
             ResultSet::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2);
-                assert!(!rows.iter().any(|row| row[0] == "Bob"));
+                assert!(!rows.iter().any(|row| cell(&row[0]) == "Bob"));
             }
             other => panic!("expected Rows, got {:?}", other),
         }
@@ -748,7 +885,7 @@ mod tests {
         match exec_sql(&mut db, &mut session, "SELECT name FROM r_emp2").unwrap() {
             ResultSet::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2, "回滚后两行都应该还在");
-                assert!(rows.iter().any(|r| r[0] == "Alice"), "Alice 应该被恢复");
+                assert!(rows.iter().any(|r| cell(&r[0]) == "Alice"), "Alice 应该被恢复");
             }
             other => panic!("got {:?}", other),
         }
@@ -776,9 +913,9 @@ mod tests {
         match exec_sql(&mut db, &mut session, "SELECT * FROM u_emp ORDER BY id").unwrap() {
             ResultSet::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 3, "UPDATE 不能改变行数");
-                assert_eq!(rows[0], vec!["1".to_string(), "21".to_string(), "Alicia".to_string()]);
-                assert_eq!(rows[1], vec!["2".to_string(), "17".to_string(), "Bob".to_string()]);
-                assert_eq!(rows[2], vec!["3".to_string(), "25".to_string(), "Carter".to_string()]);
+                assert_eq!(cells(&rows[0]), vec!["1".to_string(), "21".to_string(), "Alicia".to_string()]);
+                assert_eq!(cells(&rows[1]), vec!["2".to_string(), "17".to_string(), "Bob".to_string()]);
+                assert_eq!(cells(&rows[2]), vec!["3".to_string(), "25".to_string(), "Carter".to_string()]);
             }
             other => panic!("expected Rows, got {:?}", other),
         }
@@ -811,7 +948,7 @@ mod tests {
 
         // 事务里看得到新值
         match exec_sql(&mut db, &mut session, "SELECT name FROM ur_emp WHERE id = 1").unwrap() {
-            ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], "Zed"),
+            ResultSet::Rows { rows, .. } => assert_eq!(cell(&rows[0][0]), "Zed"),
             other => panic!("got {:?}", other),
         }
 
@@ -822,8 +959,8 @@ mod tests {
         match exec_sql(&mut db, &mut session, "SELECT * FROM ur_emp ORDER BY id").unwrap() {
             ResultSet::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2, "UPDATE 回滚后行数不能变");
-                assert_eq!(rows[0], vec!["1".to_string(), "Alice".to_string()]);
-                assert_eq!(rows[1], vec!["2".to_string(), "Bob".to_string()]);
+                assert_eq!(cells(&rows[0]), vec!["1".to_string(), "Alice".to_string()]);
+                assert_eq!(cells(&rows[1]), vec!["2".to_string(), "Bob".to_string()]);
             }
             other => panic!("got {:?}", other),
         }
@@ -846,7 +983,7 @@ mod tests {
         // 单列升序（默认）
         match exec_sql(&mut db, &mut session, "SELECT id FROM o_emp ORDER BY id").unwrap() {
             ResultSet::Rows { rows, .. } => {
-                assert_eq!(rows, vec![
+                assert_eq!(cells_all(&rows), vec![
                     vec!["1".to_string()],
                     vec!["2".to_string()],
                     vec!["3".to_string()],
@@ -858,7 +995,7 @@ mod tests {
         // 降序
         match exec_sql(&mut db, &mut session, "SELECT id FROM o_emp ORDER BY id DESC").unwrap() {
             ResultSet::Rows { rows, .. } => {
-                assert_eq!(rows, vec![
+                assert_eq!(cells_all(&rows), vec![
                     vec!["3".to_string()],
                     vec!["2".to_string()],
                     vec!["1".to_string()],
@@ -871,7 +1008,7 @@ mod tests {
         match exec_sql(&mut db, &mut session,
                        "SELECT name FROM o_emp ORDER BY age ASC, name DESC").unwrap() {
             ResultSet::Rows { rows, .. } => {
-                assert_eq!(rows, vec![
+                assert_eq!(cells_all(&rows), vec![
                     vec!["Bob".to_string()],
                     vec!["Alice".to_string()],
                     vec!["Carter".to_string()],
@@ -883,7 +1020,7 @@ mod tests {
         // ORDER BY 用不在 SELECT 列表里的列 → 允许（排序在投影之前）
         match exec_sql(&mut db, &mut session, "SELECT name FROM o_emp ORDER BY id DESC").unwrap() {
             ResultSet::Rows { rows, .. } => {
-                assert_eq!(rows, vec![
+                assert_eq!(cells_all(&rows), vec![
                     vec!["Carter".to_string()],
                     vec!["Bob".to_string()],
                     vec!["Alice".to_string()],
@@ -895,6 +1032,319 @@ mod tests {
         // 排序列不存在 → 报错
         let err = exec_sql(&mut db, &mut session, "SELECT * FROM o_emp ORDER BY ghost").unwrap_err();
         assert!(err.contains("not found"), "got: {}", err);
+
+        let _ = db.shutdown();
+    }
+
+    // ==================== NULL 专道 ====================
+
+    /// NULL 的完整链路：写入 → 位图编码 → 读回 → IS NULL 过滤
+    #[test]
+    fn test_e2e_null_roundtrip_and_is_null() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE n_emp (id INT PRIMARY KEY, name VARCHAR(50), age INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO n_emp VALUES (1, 'Alice', 20)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO n_emp VALUES (2, NULL, 30)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO n_emp VALUES (3, 'Bob', NULL)").unwrap();
+
+        // SELECT *：第 2 行的 name、第 3 行的 age 都该是 None，不能是空字符串
+        match exec_sql(&mut db, &mut session, "SELECT * FROM n_emp ORDER BY id").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[1], vec![Some("2".into()), None, Some("30".into())]);
+                assert_eq!(rows[2], vec![Some("3".into()), Some("Bob".into()), None]);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // IS NULL 是唯一能把 NULL 判成真的运算符
+        match exec_sql(&mut db, &mut session, "SELECT id FROM n_emp WHERE name IS NULL").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![vec!["2".to_string()]]),
+            other => panic!("got {:?}", other),
+        }
+        match exec_sql(&mut db, &mut session, "SELECT id FROM n_emp WHERE age IS NOT NULL ORDER BY id").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    /// 往 NOT NULL 列（包括 PRIMARY KEY）写 NULL → 存储层拒
+    #[test]
+    fn test_e2e_not_null_rejects_null() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE nn_emp (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL, age INT)").unwrap();
+
+        let err = exec_sql(&mut db, &mut session, "INSERT INTO nn_emp VALUES (1, NULL, 20)").unwrap_err();
+        assert!(err.contains("NOT NULL"), "got: {}", err);
+
+        // 主键隐含 NOT NULL
+        let err = exec_sql(&mut db, &mut session, "INSERT INTO nn_emp VALUES (NULL, 'Alice', 20)").unwrap_err();
+        assert!(err.contains("NOT NULL"), "got: {}", err);
+
+        // age 可空 → 正常写入
+        exec_sql(&mut db, &mut session, "INSERT INTO nn_emp VALUES (2, 'Bob', NULL)").unwrap();
+        match exec_sql(&mut db, &mut session, "SELECT age FROM nn_emp WHERE id = 2").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], None),
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    /// 三值逻辑：NULL 参与比较一律 unknown，WHERE / NOT / OR 都要按三值算
+    #[test]
+    fn test_e2e_three_valued_logic_where() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE t3 (id INT PRIMARY KEY, age INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO t3 VALUES (1, 20)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO t3 VALUES (2, NULL)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO t3 VALUES (3, 10)").unwrap();
+
+        let ids = |sql: &str, db: &mut Database, session: &mut Session| -> Vec<String> {
+            match exec_sql(db, session, sql).unwrap() {
+                ResultSet::Rows { rows, .. } => rows.iter().map(|r| cell(&r[0])).collect(),
+                other => panic!("got {:?}", other),
+            }
+        };
+
+        // age > 18：NULL 那行既不满足也不违反，就是不选
+        assert_eq!(ids("SELECT id FROM t3 WHERE age > 18 ORDER BY id", &mut db, &mut session),
+                   vec!["1".to_string()]);
+        // NOT (age > 18)：unknown 取反仍是 unknown → 还是只剩 id=3
+        assert_eq!(ids("SELECT id FROM t3 WHERE NOT age > 18 ORDER BY id", &mut db, &mut session),
+                   vec!["3".to_string()]);
+        // age = NULL 永远 unknown（初学 SQL 最常踩的坑）→ 0 行
+        assert!(ids("SELECT id FROM t3 WHERE age = NULL", &mut db, &mut session).is_empty());
+        // unknown OR true = true → NULL 行靠 IS NULL 拉回来
+        assert_eq!(
+            ids("SELECT id FROM t3 WHERE age > 18 OR age IS NULL ORDER BY id", &mut db, &mut session),
+            vec!["1".to_string(), "2".to_string()]
+        );
+
+        let _ = db.shutdown();
+    }
+
+    /// UPDATE 可以把列改成 NULL；改 NOT NULL 列时被拒且不动数据
+    #[test]
+    fn test_e2e_update_set_null() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE u4 (id INT PRIMARY KEY, name VARCHAR(20), age INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO u4 VALUES (1, 'Alice', 20)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO u4 VALUES (2, 'Bob', 30)").unwrap();
+
+        let r = exec_sql(&mut db, &mut session, "UPDATE u4 SET name = NULL WHERE id = 1").unwrap();
+        assert!(matches!(r, ResultSet::Affected(1)), "got {:?}", r);
+
+        match exec_sql(&mut db, &mut session, "SELECT * FROM u4 ORDER BY id").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows[0], vec![Some("1".into()), None, Some("20".into())]);
+                assert_eq!(rows[1], vec![Some("2".into()), Some("Bob".into()), Some("30".into())]);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // 主键是 NOT NULL：报错，而且回退在“删旧行”之前，原数据一点没动
+        let err = exec_sql(&mut db, &mut session, "UPDATE u4 SET id = NULL WHERE id = 2").unwrap_err();
+        assert!(err.contains("NOT NULL"), "got: {}", err);
+        match exec_sql(&mut db, &mut session, "SELECT * FROM u4 ORDER BY id").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "报错前不能把行删掉");
+                assert_eq!(cell(&rows[1][1]), "Bob");
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    /// 排序时 NULL 排最前（MySQL `ORDER BY ... ASC` 的行为），DESC 那么它自然落到最后
+    #[test]
+    fn test_e2e_order_by_null_position() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE o5 (id INT PRIMARY KEY, age INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO o5 VALUES (1, 20)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO o5 VALUES (2, NULL)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO o5 VALUES (3, 10)").unwrap();
+
+        match exec_sql(&mut db, &mut session, "SELECT id FROM o5 ORDER BY age").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![
+                vec!["2".to_string()],   // NULL 最小，排第一
+                vec!["3".to_string()],
+                vec!["1".to_string()],
+            ]),
+            other => panic!("got {:?}", other),
+        }
+        match exec_sql(&mut db, &mut session, "SELECT id FROM o5 ORDER BY age DESC").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(cell(&rows[2][0]), "2", "DESC 时 NULL 排最后"),
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    /// DELETE 同样只删 WHERE 为 TRUE 的行：age 为 NULL 的行不会被 `age > 18` 误删
+    #[test]
+    fn test_e2e_delete_where_null() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE d6 (id INT PRIMARY KEY, age INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO d6 VALUES (1, 20)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO d6 VALUES (2, NULL)").unwrap();
+
+        let r = exec_sql(&mut db, &mut session, "DELETE FROM d6 WHERE age > 18").unwrap();
+        assert!(matches!(r, ResultSet::Affected(1)), "got {:?}", r);
+
+        match exec_sql(&mut db, &mut session, "SELECT * FROM d6").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "NULL 行必须活着");
+                assert_eq!(rows[0], vec![Some("2".into()), None]);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    /// 带列名列表的 INSERT：可以乱序、可以只写一部分，剩下的列补 NULL
+    #[test]
+    fn test_e2e_insert_column_list() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE c7 (id INT PRIMARY KEY, name VARCHAR(20), age INT)").unwrap();
+
+        // 乱序 + 只写两列：name 没被点名 → NULL
+        exec_sql(&mut db, &mut session, "INSERT INTO c7 (age, id) VALUES (30, 7)").unwrap();
+        match exec_sql(&mut db, &mut session, "SELECT * FROM c7").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows[0], vec![
+                Some("7".into()), None, Some("30".into()),
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // 列名不存在 / 列名重复 / 数量对不上 / 漏掉主键——全部在动数据之前拒掉
+        let err = exec_sql(&mut db, &mut session, "INSERT INTO c7 (ghost) VALUES (1)").unwrap_err();
+        assert!(err.contains("not found"), "got: {}", err);
+        let err = exec_sql(&mut db, &mut session, "INSERT INTO c7 (id, id) VALUES (8, 9)").unwrap_err();
+        assert!(err.contains("duplicate column"), "got: {}", err);
+        let err = exec_sql(&mut db, &mut session, "INSERT INTO c7 (id, age) VALUES (8)").unwrap_err();
+        assert!(err.contains("expected 2 values"), "got: {}", err);
+        let err = exec_sql(&mut db, &mut session, "INSERT INTO c7 (name) VALUES ('solo')").unwrap_err();
+        assert!(err.contains("NOT NULL"), "got: {}", err);
+
+        // 上面四条都失败了，表里还是只有那一行
+        match exec_sql(&mut db, &mut session, "SELECT id FROM c7").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![vec!["7".to_string()]]),
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    /// DEFAULT：INSERT 没点名的列自动填默认值；显式给值（含显式 NULL）不覆盖默认值语义
+    #[test]
+    fn test_e2e_default_fill() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE dd (id INT PRIMARY KEY, qty INT DEFAULT 0, tag VARCHAR(10) DEFAULT 'none', note VARCHAR(10))").unwrap();
+
+        // 只点名 id：qty 填 0、tag 填 'none'，note 无默认→ NULL
+        exec_sql(&mut db, &mut session, "INSERT INTO dd (id) VALUES (1)").unwrap();
+        match exec_sql(&mut db, &mut session, "SELECT * FROM dd WHERE id = 1").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows[0], vec![
+                Some("1".into()), Some("0".into()), Some("none".into()), None,
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // 显式给值覆盖默认
+        exec_sql(&mut db, &mut session, "INSERT INTO dd (id, qty) VALUES (2, 99)").unwrap();
+        match exec_sql(&mut db, &mut session, "SELECT qty, tag FROM dd WHERE id = 2").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows[0], vec![Some("99".into()), Some("none".into())]),
+            other => panic!("got {:?}", other),
+        }
+
+        // SQL 语义：显式写 NULL 就是 NULL，不会被默认值替（跟“没列这个字段”是两回事）
+        exec_sql(&mut db, &mut session, "INSERT INTO dd (id, tag) VALUES (3, NULL)").unwrap();
+        match exec_sql(&mut db, &mut session, "SELECT tag FROM dd WHERE id = 3").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], None, "显式 NULL 不应被默认值替"),
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    /// UNIQUE：非主键的唯一列撞车报错；但 NULL 不参与唯一性判定（InnoDB 行为）
+    #[test]
+    fn test_e2e_unique_constraint() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE uq (id INT PRIMARY KEY, code VARCHAR(20) UNIQUE)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO uq VALUES (1, 'A')").unwrap();
+
+        // 重复的 code='A' → 拒
+        let err = exec_sql(&mut db, &mut session, "INSERT INTO uq VALUES (2, 'A')").unwrap_err();
+        assert!(err.contains("Duplicate"), "got: {}", err);
+
+        // code 为 NULL 的行允许多次（SQL 标准：NULL 互不相等）
+        exec_sql(&mut db, &mut session, "INSERT INTO uq (id) VALUES (3)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO uq (id) VALUES (4)").unwrap();
+
+        match exec_sql(&mut db, &mut session, "SELECT id FROM uq ORDER BY id").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 3, "一行 A + 两行 NULL code"),
+            other => panic!("got {:?}", other),
+        }
 
         let _ = db.shutdown();
     }

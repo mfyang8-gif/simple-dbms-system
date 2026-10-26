@@ -5,7 +5,7 @@ use crate::recovery::log_record::TxnId;
 use crate::recovery::lsn::Lsn;
 use std::sync::Mutex;
 use crate::record::Record;
-use crate::row::{Row, RowBuilder};
+use crate::row::{Row, RowBuilder, RowCursor};
 
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::free_page_manager::FreePageManager;
@@ -287,7 +287,12 @@ impl CheckCondition {
             Some(i) => i,
             None => return Ok(true),
         };
-        let actual_value = extract_single_column_value(row, columns, col_idx)?;
+        let actual_value = match extract_single_column_value(row, columns, col_idx)? {
+            Some(v) => v,
+            // NULL 列：三值逻辑下 CHECK 的结果是 unknown，SQL 标准把 unknown 当作通过
+            // （只有明确判为 false 才拒）
+            None => return Ok(true),
+        };
         let is_int = columns[col_idx].col_type.is_int();
 
         match &self.op {
@@ -302,17 +307,17 @@ impl CheckCondition {
     }
 }
 
-fn extract_single_column_value(row: &Row, columns: &[Column], col_idx: usize) -> std::io::Result<String> {
-    let mut cursor = row.cursor();
+fn extract_single_column_value(row: &Row, columns: &[Column], col_idx: usize) -> std::io::Result<Option<String>> {
+    let mut cursor = row.cursor_with_cols(columns.len())?;
     for i in 0..columns.len() {
         match &columns[i].col_type {
             ColumnType::Int => {
-                let v = cursor.get_int()?;
-                if i == col_idx { return Ok(v.to_string()); }
+                let v = cursor.get_int_opt()?;
+                if i == col_idx { return Ok(v.map(|n| n.to_string())); }
             }
             ColumnType::Varchar(_) => {
-                let s = cursor.get_varchar()?;
-                if i == col_idx { return Ok(s.to_string()); }
+                let s = cursor.get_varchar_opt()?;
+                if i == col_idx { return Ok(s.map(|x| x.to_string())); }
             }
         }
     }
@@ -343,32 +348,60 @@ pub struct TypedRowBuilder<'a> {
 impl<'a> TypedRowBuilder<'a> {
     pub fn new(columns: &'a [Column]) -> Self { Self { builder: RowBuilder::new(), columns, current_col: 0 } }
 
+    /// 取当前列；写超列数时给个错，而不是 panic 越界
+    fn current_column(&self) -> std::io::Result<&'a Column> {
+        self.columns.get(self.current_col).ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("too many values: table '{}' has {} columns", self.columns.first().map(|c| c.name.as_str()).unwrap_or(""), self.columns.len()),
+        ))
+    }
+
     pub fn put_int(mut self, value: u32) -> std::io::Result<Self> {
-        let col = &self.columns[self.current_col];
+        let col = self.current_column()?;
         if col.col_type.is_int() {
             self.builder = self.builder.put_int(value);
             self.current_col += 1;
             Ok(self)
         } else {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Type mismatch"))
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("type mismatch: column '{}' is not INT", col.name)))
         }
     }
 
     pub fn put_varchar(mut self, value: &str) -> std::io::Result<Self> {
-        let col = &self.columns[self.current_col];
+        let col = self.current_column()?.clone();
         if let ColumnType::Varchar(max_len) = col.col_type {
-            if value.len() > max_len { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "VARCHAR too long")); }
+            if value.len() > max_len {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                    format!("VARCHAR too long for column '{}': {} bytes, max is {}", col.name, value.len(), max_len)));
+            }
             self.builder = self.builder.put_varchar(value)?;
             self.current_col += 1;
             Ok(self)
         } else {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Type mismatch"))
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("type mismatch: column '{}' is not VARCHAR", col.name)))
         }
+    }
+
+    /// 写入 NULL：列被声明为 NOT NULL（包括 PRIMARY KEY）时直接拒
+    pub fn put_null(mut self) -> std::io::Result<Self> {
+        let col = self.current_column()?.clone();
+        if !col.nullable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Column '{}' is NOT NULL, cannot insert NULL", col.name),
+            ));
+        }
+        self.builder = self.builder.put_null();
+        self.current_col += 1;
+        Ok(self)
     }
 
     pub fn build(self) -> std::io::Result<Row> {
         if self.current_col != self.columns.len() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Column count mismatch"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Column count mismatch: got {}, expected {}", self.current_col, self.columns.len()),
+            ));
         }
         Ok(self.builder.build())
     }
@@ -573,29 +606,46 @@ impl Table {
         self.insert_raw(&record, free_mgr, catalog, txn_mgr, txn)
     }
 
+    /// 按列类型消耗游标上的一格（NULL 列不读值区字节，但列下标照样前进）
+    fn skip_one_col(cursor: &mut RowCursor, col: &Column) -> std::io::Result<()> {
+        match &col.col_type {
+            ColumnType::Int => { cursor.get_int_opt()?; }
+            ColumnType::Varchar(_) => { cursor.get_varchar_opt()?; }
+        }
+        Ok(())
+    }
+
     fn fill_auto_increment(&mut self, row: Row) -> std::io::Result<Row> {
         let auto_cols: Vec<usize> = self.columns.iter().enumerate()
             .filter(|(_, c)| c.auto_increment).map(|(i, _)| i).collect();
 
         if auto_cols.is_empty() { return Ok(row); }
 
-        let mut cursor = row.cursor();
+        let mut cursor = row.cursor_with_cols(self.columns.len())?;
         let mut builder = RowBuilder::new();
 
         for (i, col) in self.columns.iter().enumerate() {
             if auto_cols.contains(&i) {
-                match &col.col_type {
-                    ColumnType::Int => { cursor.get_int()?; }
-                    ColumnType::Varchar(_) => { cursor.get_varchar()?; }
-                }
+                // 自增列：用户给的值（包括 NULL）一律丢掉，由系统发号
+                Self::skip_one_col(&mut cursor, col)?;
 
                 let next_id = self.auto_increment_next.entry(col.name.clone()).or_insert(1);
                 builder = builder.put_int(*next_id);
                 *next_id += 1;
             } else {
                 match &col.col_type {
-                    ColumnType::Int => { builder = builder.put_int(cursor.get_int()?); }
-                    ColumnType::Varchar(_) => { builder = builder.put_varchar(cursor.get_varchar()?)?; }
+                    ColumnType::Int => {
+                        builder = match cursor.get_int_opt()? {
+                            Some(v) => builder.put_int(v),
+                            None => builder.put_null(),
+                        };
+                    }
+                    ColumnType::Varchar(_) => {
+                        builder = match cursor.get_varchar_opt()? {
+                            Some(s) => builder.put_varchar(s)?,
+                            None => builder.put_null(),
+                        };
+                    }
                 }
             }
         }
@@ -621,6 +671,11 @@ impl Table {
         Ok(())
     }
 
+    /// 唯一列冲突判定。
+    /// 【逐列独立判定】每个 unique/主键列单独算：`PRIMARY KEY` 与 `UNIQUE` 是两个互不相干的约束，
+    /// 不能把多列当成一个复合键整体比较（否则 (1,'A') 与 (2,'A') 会被判不等，漏掉 code 冲突）。
+    /// SQL 标准：NULL 与任何值都不相等，所以**某唯一列为 NULL 的行不参与该列的冲突判定**，
+    /// 允许该列出现多个 NULL（但不能因此跳过其它列的判定）。MySQL InnoDB 就是这么做的。
     fn check_unique_constraints(&self, new_row: &Row) -> std::io::Result<()> {
         let unique_cols: Vec<usize> = self.columns.iter().enumerate()
             .filter(|(_, col)| col.primary_key || col.unique).map(|(i, _)| i).collect();
@@ -628,35 +683,47 @@ impl Table {
         if unique_cols.is_empty() { return Ok(()); }
         let new_values = self.extract_column_values(new_row, &unique_cols)?;
 
+        // 扫一遍旧行，按列收集“已被占用的非 NULL 值”：occupied[pos] 对应 unique_cols[pos]
+        let mut occupied: Vec<Vec<Vec<u8>>> = vec![Vec::new(); unique_cols.len()];
         for (_, existing_record) in self.scan_all()? {
             let existing_row = Row::from_record(&existing_record);
             let existing_values = self.extract_column_values(&existing_row, &unique_cols)?;
+            for (pos, v) in existing_values.into_iter().enumerate() {
+                if let Some(bytes) = v { occupied[pos].push(bytes); }
+            }
+        }
 
-            if new_values.iter().zip(existing_values.iter()).all(|(a, b)| a == b) {
-                let col = &self.columns[unique_cols[0]];
-                let kind = if col.primary_key { "PRIMARY KEY" } else { "UNIQUE" };
-                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("Duplicate value for {} column '{}'", kind, col.name)));
+        // 逐列比对：该列的新值只要落在旧值集合里就冲突（NULL 跳过）
+        for (pos, &col_idx) in unique_cols.iter().enumerate() {
+            if let Some(new_val) = &new_values[pos] {
+                if occupied[pos].iter().any(|e| e == new_val) {
+                    let col = &self.columns[col_idx];
+                    let kind = if col.primary_key { "PRIMARY KEY" } else { "UNIQUE" };
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("Duplicate value for {} column '{}'", kind, col.name),
+                    ));
+                }
             }
         }
         Ok(())
     }
 
-    fn extract_column_values(&self, row: &Row, col_indices: &[usize]) -> std::io::Result<Vec<Vec<u8>>> {
+    /// 抽出指定列的字节用于比较；None 代表 NULL。
+    /// 用 Option 而不是把 NULL 编码成空字节，是为了不让“空字符串”与 NULL 撞车。
+    fn extract_column_values(&self, row: &Row, col_indices: &[usize]) -> std::io::Result<Vec<Option<Vec<u8>>>> {
         let mut values = Vec::new();
-        let mut cursor = row.cursor();
+        let mut cursor = row.cursor_with_cols(self.columns.len())?;
         let mut current_col = 0;
 
         for &target_col in col_indices {
             while current_col < target_col {
-                match &self.columns[current_col].col_type {
-                    ColumnType::Int => { cursor.get_int()?; }
-                    ColumnType::Varchar(_) => { cursor.get_varchar()?; }
-                }
+                Self::skip_one_col(&mut cursor, &self.columns[current_col])?;
                 current_col += 1;
             }
             let value = match &self.columns[target_col].col_type {
-                ColumnType::Int => cursor.get_int()?.to_le_bytes().to_vec(),
-                ColumnType::Varchar(_) => cursor.get_varchar()?.as_bytes().to_vec(),
+                ColumnType::Int => cursor.get_int_opt()?.map(|v| v.to_le_bytes().to_vec()),
+                ColumnType::Varchar(_) => cursor.get_varchar_opt()?.map(|s| s.as_bytes().to_vec()),
             };
             values.push(value);
             current_col += 1;

@@ -99,6 +99,11 @@ fn escape_value(s: &str) -> String {
     out
 }
 
+/// 协议里 NULL 的写法：跟 MySQL 的 LOAD DATA 习惯一致，用反斜杠 + N 两个字符表示。
+/// 为什么不能直接写 "NULL" 四个字母：那一列就分不清是字符串 'NULL' 还是真的没值。
+/// 字面上的字符串（反斜杠 N）经过 escape_value 会变成双反斜杠 + N，所以两者不会撞车。
+pub const NULL_TOKEN: &str = "\\N";
+
 /// 把执行结果编码成协议文本（不含最后那个换行，由发送方补）
 ///
 /// Ok            → "OK 0"
@@ -117,7 +122,13 @@ pub fn format_result(rs: &ResultSet) -> String {
             out.push('\n');
 
             for row in rows {
-                let cells: Vec<String> = row.iter().map(|v| escape_value(v)).collect();
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|v| match v {
+                        None => NULL_TOKEN.to_string(),
+                        Some(s) => escape_value(s),
+                    })
+                    .collect();
                 out.push_str(&cells.join("\t"));
                 out.push('\n');
             }
@@ -139,6 +150,11 @@ fn pad_right(s: &str, width: usize) -> String {
     }
 }
 
+/// 终端显示用的单元格：NULL 就写 NULL，不写空
+fn display_cell(cell: &Option<String>) -> String {
+    cell.clone().unwrap_or_else(|| "NULL".to_string())
+}
+
 /// 给终端看的对齐表格（REPL 专用，不是协议格式）
 pub fn format_for_human(rs: &ResultSet) -> String {
     match rs {
@@ -149,11 +165,12 @@ pub fn format_for_human(rs: &ResultSet) -> String {
                 return format!("(0 rows)\n{}", columns.join(" | "));
             }
 
+            // 给人看时 NULL 就写成 NULL（宽度和对齐都按这个字符串算）
             let mut widths: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
             for row in rows {
                 for (i, cell) in row.iter().enumerate() {
                     if i < widths.len() {
-                        widths[i] = widths[i].max(cell.chars().count());
+                        widths[i] = widths[i].max(display_cell(cell).chars().count());
                     }
                 }
             }
@@ -176,7 +193,7 @@ pub fn format_for_human(rs: &ResultSet) -> String {
                 let cells: Vec<String> = row
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| pad_right(c, widths[i]))
+                    .map(|(i, c)| pad_right(&display_cell(c), widths[i]))
                     .collect();
                 out.push_str(&cells.join(" | "));
                 out.push('\n');
@@ -245,11 +262,26 @@ mod tests {
         let rs = ResultSet::Rows {
             columns: vec!["id".into(), "name".into()],
             rows: vec![
-                vec!["1".into(), "Alice".into()],
-                vec!["2".into(), "Bob".into()],
+                vec![Some("1".into()), Some("Alice".into())],
+                vec![Some("2".into()), Some("Bob".into())],
             ],
         };
         assert_eq!(format_result(&rs), "ROWS 2 2\nid\tname\n1\tAlice\n2\tBob\nEND");
+    }
+
+    #[test]
+    fn test_format_rows_null_cell() {
+        let rs = ResultSet::Rows {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![
+                vec![Some("1".into()), None],
+                vec![Some("2".into()), Some("NULL".into())],   // 字面字符串 "NULL"
+                vec![Some("3".into()), Some("\\N".into())],    // 字面字符串 "\N"
+            ],
+        };
+        let out = format_result(&rs);
+        // 真 NULL → \N；字符串 NULL → NULL；字符串 \N → \\N，三者互不混淆
+        assert_eq!(out, "ROWS 2 3\nid\tname\n1\t\\N\n2\tNULL\n3\t\\\\N\nEND");
     }
 
     #[test]
@@ -263,11 +295,11 @@ mod tests {
     fn test_format_for_human_has_header_and_count() {
         let rs = ResultSet::Rows {
             columns: vec!["id".into(), "name".into()],
-            rows: vec![vec!["1".into(), "Alice".into()]],
+            rows: vec![vec![Some("1".into()), None]],
         };
         let out = format_for_human(&rs);
         assert!(out.contains("id"));
-        assert!(out.contains("Alice"));
+        assert!(out.contains("NULL"), "got: {}", out);
         assert!(out.contains("(1 row(s))"));
     }
 }

@@ -197,9 +197,11 @@ impl Parser {
                 }
                 tok => return Err(format!("expected type, got {:?}", tok)),
             };
-            // 可选约束：PRIMARY KEY / NOT NULL（都可以没有）
+            // 可选约束：PRIMARY KEY / NOT NULL / UNIQUE / DEFAULT <值>（都可以没有）
             let mut primary_key = false;
             let mut not_null = false;
+            let mut unique = false;
+            let mut default: Option<LitValue> = None;
             loop {
                 if self.peek() == &Token::Primary {
                     self.advance();
@@ -209,11 +211,23 @@ impl Parser {
                     self.advance();
                     self.expect(&Token::Null)?;
                     not_null = true;
+                } else if self.peek() == &Token::Unique {
+                    self.advance();
+                    unique = true;
+                } else if self.peek() == &Token::Default {
+                    self.advance();
+                    // DEFAULT 后面只能跟一个字面量：数字 / 字符串（NULL 当干没写）
+                    default = match self.advance() {
+                        Token::Number(n) => Some(LitValue::Number(n)),
+                        Token::Str(s) => Some(LitValue::Str(s)),
+                        Token::Null => None,   // `DEFAULT NULL` = 没写默认值
+                        tok => return Err(format!("expected literal after DEFAULT, got {:?}", tok)),
+                    };
                 } else {
                     break;
                 }
             }
-            columns.push(ColumnDef { name: col_name, data_type, primary_key, not_null });
+            columns.push(ColumnDef { name: col_name, data_type, primary_key, not_null, unique, default });
 
             if self.peek() != &Token::Comma { break; }
             self.advance();
@@ -279,13 +293,24 @@ impl Parser {
 
     /// AND 层
     fn parse_expr_and(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_comparison()?;
+        let mut left = self.parse_expr_not()?;
         while self.peek() == &Token::And {
             self.advance();
-            let right = self.parse_comparison()?;
+            let right = self.parse_expr_not()?;
             left = Expr::And(Box::new(left), Box::new(right));
         }
         Ok(left)
+    }
+
+    /// NOT 层：优先级卡在 AND 与比较之间，`NOT a = 1 AND b = 2` 读作 `(NOT a=1) AND b=2`
+    fn parse_expr_not(&mut self) -> Result<Expr, String> {
+        if self.peek() == &Token::Not {
+            self.advance();
+            // 递归一层，支持 NOT NOT x（虽然没什么用，但语法上不能说谎）
+            let inner = self.parse_expr_not()?;
+            return Ok(Expr::Not(Box::new(inner)));
+        }
+        self.parse_comparison()
     }
 
     /// 比较层（最高优先级）：column op value, 或 column LIKE 'pattern'
@@ -316,16 +341,29 @@ impl Parser {
                     Err("expected string pattern after LIKE".to_string())
                 }
             }
+            Token::Is => {
+                self.advance();
+                // IS NULL / IS NOT NULL
+                let negated = if self.peek() == &Token::Not {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                self.expect(&Token::Null)?;
+                Ok(Expr::IsNull { expr: Box::new(left), negated })
+            }
             _ => Ok(left), // 没有比较运算符，直接返回左操作数
         }
     }
 
-    /// 解析"原子"表达式：列名、数字、字符串
+    /// 解析"原子"表达式：列名、数字、字符串、NULL
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.advance() {
             Token::Ident(name) => Ok(Expr::Column(name)),
             Token::Number(n) => Ok(Expr::Literal(LitValue::Number(n))),
             Token::Str(s) => Ok(Expr::Literal(LitValue::Str(s))),
+            Token::Null => Ok(Expr::Literal(LitValue::Null)),
             tok => Err(format!("unexpected token in expression: {:?}", tok)),
         }
     }
@@ -339,6 +377,27 @@ mod tests {
     fn parse_sql(sql: &str) -> Result<Statement, String> {
         let tokens = Lexer::new(sql).tokenize()?;
         Parser::new(tokens).parse()
+    }
+
+    #[test]
+    fn test_create_table_unique_and_default() {
+        let s = parse_sql(
+            "CREATE TABLE t (code VARCHAR(20) UNIQUE, qty INT DEFAULT 0, name VARCHAR(10) NOT NULL DEFAULT 'x')").unwrap();
+        match s {
+            Statement::CreateTable { columns, .. } => {
+                assert_eq!(columns.len(), 3);
+                // code VARCHAR(20) UNIQUE
+                assert!(columns[0].unique);
+                assert_eq!(columns[0].default, None);
+                // qty INT DEFAULT 0
+                assert!(!columns[1].unique);
+                assert_eq!(columns[1].default, Some(LitValue::Number(0)));
+                // name NOT NULL DEFAULT 'x'
+                assert!(columns[2].not_null);
+                assert_eq!(columns[2].default, Some(LitValue::Str("x".into())));
+            }
+            other => panic!("expected CreateTable, got {:?}", other),
+        }
     }
 
     #[test]
@@ -508,6 +567,75 @@ mod tests {
                 ]);
             }
             other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_where_not() {
+        // NOT 卡在 AND 与比较之间：`NOT age > 18` 取反的是整个比较，不是 age
+        let s = parse_sql("SELECT * FROM t WHERE NOT age > 18").unwrap();
+        match s {
+            Statement::Select { filter: Some(Expr::Not(inner)), .. } => {
+                assert!(matches!(*inner, Expr::BinOp { op: BinOp::Gt, .. }), "got {:?}", inner);
+            }
+            other => panic!("expected NOT, got {:?}", other),
+        }
+
+        // `NOT a IS NULL AND b = 2` → And(Not(IsNull), b=2)
+        let s = parse_sql("SELECT * FROM t WHERE NOT a IS NULL AND b = 2").unwrap();
+        match s {
+            Statement::Select { filter: Some(Expr::And(l, r)), .. } => {
+                assert!(matches!(*l, Expr::Not(_)), "got {:?}", l);
+                assert!(matches!(*r, Expr::BinOp { op: BinOp::Eq, .. }), "got {:?}", r);
+            }
+            other => panic!("expected And, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_insert_null_value() {
+        let s = parse_sql("INSERT INTO t (id, name) VALUES (1, NULL)").unwrap();
+        match s {
+            Statement::Insert { values, .. } => {
+                assert_eq!(values, vec![
+                    Expr::Literal(LitValue::Number(1)),
+                    Expr::Literal(LitValue::Null),
+                ]);
+            }
+            other => panic!("expected Insert, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_is_null_and_is_not_null() {
+        let s = parse_sql("SELECT * FROM t WHERE remark IS NULL").unwrap();
+        match s {
+            Statement::Select { filter: Some(Expr::IsNull { expr, negated }), .. } => {
+                assert_eq!(*expr, Expr::Column("remark".into()));
+                assert!(!negated);
+            }
+            other => panic!("expected Select with IS NULL, got {:?}", other),
+        }
+
+        let s = parse_sql("SELECT * FROM t WHERE remark IS NOT NULL").unwrap();
+        match s {
+            Statement::Select { filter: Some(Expr::IsNull { negated, .. }), .. } => {
+                assert!(negated);
+            }
+            other => panic!("expected Select with IS NOT NULL, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_update_set_null() {
+        let s = parse_sql("UPDATE t SET name = NULL WHERE id = 1").unwrap();
+        match s {
+            Statement::Update { assignments, .. } => {
+                assert_eq!(assignments, vec![
+                    ("name".to_string(), Expr::Literal(LitValue::Null)),
+                ]);
+            }
+            other => panic!("expected Update, got {:?}", other),
         }
     }
 }

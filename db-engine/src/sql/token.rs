@@ -9,11 +9,13 @@ pub enum Token {
     Update, Set,
     Delete,
     Create, Table, Drop,
-    And, Or, Not, Like,
+    And, Or, Not, Like, Is,
     Join, On,
     Group, By, Order, Asc, Desc,
     Begin, Commit, Rollback,
     Int, Varchar, Primary, Key, Null, As, Distinct,
+    // 列约束关键字
+    Unique, Default,
     // 聚合函数
     Sum, Count, Avg, Min, Max,
 
