@@ -154,6 +154,58 @@ pub fn undo(
     }
     Ok(())
 }
+/// 运行时单事务回滚（ROLLBACK 调用）：只撤一个事务，从 TM 给的 last_lsn 出发，
+/// 先把内存日志刷盘再读，然后沿 prev_lsn 链写 CLR + 恢复 before image。
+pub fn undo_txn(
+    txn_id: TxnId,
+    start_lsn: Lsn,
+    buffer_pool: &Arc<BufferPool>,
+    log: &Arc<LogManager>,
+    log_path: &str,
+) -> std::io::Result<()> {
+    // ① 日志可能还在内存缓冲里，先落盘再读，保证能看到本事务所有 Update
+    log.flush()?;
+    let records = LogManager::read_all(log_path)?;
+    let by_lsn: HashMap<Lsn, &LogRecord> = records.iter().map(|(l, r)| (*l, r)).collect();
+
+    let mut next_undo: Lsn = start_lsn;
+
+    // ② 沿链往回走，直到 Begin
+    while next_undo != INVALID_LSN {
+        let rec = match by_lsn.get(&next_undo) {
+            Some(r) => *r,
+            None => break,
+        };
+        match rec {
+            LogRecord::Update { page_id, offset, before, prev_lsn, txn_id: rec_txn, .. } => {
+                if *rec_txn != txn_id { break; }
+
+                // ③ 先写 CLR（补偿日志）并刷盘 —— WAL 规则：先日志后数据
+                let clr = LogRecord::Compensate {
+                    txn_id,
+                    prev_lsn: next_undo,
+                    page_id: *page_id,
+                    offset: *offset,
+                    before: before.clone(),
+                    undo_next_lsn: *prev_lsn,
+                };
+                let clr_lsn = log.append(&clr);
+                log.flush_to(clr_lsn).expect("flush CLR failed");
+
+                // ④ 把 before image 写回页，page_lsn 记 CLR 的 LSN
+                let page_ref = buffer_pool.fetch_page(*page_id)?;
+                let mut page = page_ref.write().unwrap();
+                apply_undo_to_page(&mut page, clr_lsn, *page_id, *offset, before);
+
+                next_undo = *prev_lsn;
+            }
+            LogRecord::Begin { .. } => break,
+            LogRecord::Abort { .. } => break,
+            _ => break,
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

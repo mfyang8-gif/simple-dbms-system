@@ -89,7 +89,6 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
         Statement::Select { columns, table, filter, .. } => execute_select(columns, table, filter, db),
         Statement::Delete { table, filter } => execute_delete(table, filter, db, session),
         Statement::Begin => {
-            // 已在事务中 → 报错，防止嵌套
             if session.txn_id.is_some() {
                 return Err("transaction already in progress".into());
             }
@@ -99,14 +98,27 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
         }
         Statement::Commit => {
             let txn_id = session.txn_id.ok_or("no transaction in progress")?;
-            // commit 内部已 flush 到 Commit LSN → 提交即持久
             db.txn_mgr().lock().unwrap().commit(txn_id);
             session.txn_id = None;
             Ok(ResultSet::Ok)
         }
         Statement::Rollback => {
-            // 第一刀：诚实拒绝。不 abort、不清 session —— 事务仍在，客户端可继续或 COMMIT
-            Err("ROLLBACK not supported yet (runtime undo lands in the next slice)".into())
+            let txn_id = session.txn_id.ok_or("no transaction in progress")?;
+            let last_lsn = db.txn_mgr().lock().unwrap().last_lsn(txn_id);
+
+            // 运行时 Undo：沿 prev_lsn 链撤回所有 Update（写 CLR + 恢复 before image）
+            crate::recovery::restore::undo_txn(
+                txn_id,
+                last_lsn,
+                db.buffer_pool(),
+                db.log_manager(),
+                crate::config::LOG_FILE,
+            ).map_err(|e| format!("rollback failed: {}", e))?;
+
+            // 写 Abort 日志 + 从活跃表摘除
+            db.txn_mgr().lock().unwrap().abort(txn_id);
+            session.txn_id = None;
+            Ok(ResultSet::Ok)
         }
         Statement::Update { .. } => Err("UPDATE not yet implemented".into()),
     }
@@ -530,18 +542,49 @@ mod tests {
     }
 
     #[test]
-    fn test_e2e_rollback_rejected_for_now() {
+    fn test_e2e_rollback_undoes_insert() {
         let _ = std::fs::remove_file(crate::config::DB_FILE);
         let _ = std::fs::remove_file(crate::config::LOG_FILE);
         let mut db = Database::open().unwrap();
         let mut session = Session::new();
 
-        exec_sql(&mut db, &mut session, "CREATE TABLE t_emp2 (id INT PRIMARY KEY)").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE TABLE r_emp (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
         exec_sql(&mut db, &mut session, "BEGIN").unwrap();
-        exec_sql(&mut db, &mut session, "INSERT INTO t_emp2 VALUES (1)").unwrap();
-        let err = exec_sql(&mut db, &mut session, "ROLLBACK").unwrap_err();
-        assert!(err.contains("not supported"), "got: {}", err);
+        exec_sql(&mut db, &mut session, "INSERT INTO r_emp VALUES (1, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO r_emp VALUES (2, 'Bob')").unwrap();
+
+        exec_sql(&mut db, &mut session, "ROLLBACK").unwrap();
+        assert!(session.txn_id.is_none());
+
+        // 回滚后两行都应该消失
+        match exec_sql(&mut db, &mut session, "SELECT * FROM r_emp").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 0, "回滚后应该没有数据"),
+            other => panic!("got {:?}", other),
+        }
         let _ = db.shutdown();
     }
+    #[test]
+    fn test_e2e_rollback_undoes_delete() {
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
 
+        exec_sql(&mut db, &mut session, "CREATE TABLE r_emp2 (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO r_emp2 VALUES (1, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO r_emp2 VALUES (2, 'Bob')").unwrap();
+
+        exec_sql(&mut db, &mut session, "BEGIN").unwrap();
+        exec_sql(&mut db, &mut session, "DELETE FROM r_emp2 WHERE id = 1").unwrap();
+        exec_sql(&mut db, &mut session, "ROLLBACK").unwrap();
+
+        match exec_sql(&mut db, &mut session, "SELECT name FROM r_emp2").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "回滚后两行都应该还在");
+                assert!(rows.iter().any(|r| r[0] == "Alice"), "Alice 应该被恢复");
+            }
+            other => panic!("got {:?}", other),
+        }
+        let _ = db.shutdown();
+    }
 }
