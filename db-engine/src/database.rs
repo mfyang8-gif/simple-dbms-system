@@ -72,13 +72,17 @@ impl Database {
         }
 
 
-        // Page 1: FreePageManager
+        // Page 1: FreePageManager（位图自己就在 Page 1，必须保留）
         let mut free_mgr = FreePageManager::new(PAGE_SIZE as u64, MAX_PAGES);
         free_mgr.mark_used(0); // FileHeader
-        free_mgr.flush(&buffer_pool)?;
-
-        // Page 2: Catalog（空）
+        free_mgr.mark_used(1); // FreePageManager 位图页
+        free_mgr.mark_used(2); // Catalog 首页
         let catalog = Catalog::new(buffer_pool.clone());
+
+        // ★ 初始化必须立即落盘：
+        //   preallocate 已经把文件扩成 3 个零页，而 FileHeader 目前只在 buffer pool 内存里。
+        //   若在 shutdown 之前退出，下次 open 会看到“文件非空 + magic=0”，被误判成已有库。
+        buffer_pool.flush()?;
 
         Ok(Self { buffer_pool, catalog, free_mgr, file_header, log_manager, txn_mgr })
     }
@@ -90,12 +94,18 @@ impl Database {
         let page0 = buffer_pool.fetch_page(0)?;
         let file_header = FileHeader::read_from_page(&page0.read().unwrap())?;
 
-        // Page 1: 恢复 FreePageManager
+        // Page 1: FreePageManager 先占位，等 Catalog 恢复完再整体重建（位图是派生状态）
         let mut free_mgr = FreePageManager::new(PAGE_SIZE as u64, MAX_PAGES);
-        free_mgr.load(&buffer_pool)?;
+
+        // 先 redo/undo：把所有已提交的页修改重放进 buffer pool
         crate::recovery::restore::restore(&crate::config::LOG_FILE, &buffer_pool, &log_manager)?;
-        // Page 2+: 恢复 Catalog
+
+        // Page 2+: 从（可能已被 redo 修正过的）页里恢复 Catalog
         let catalog = Catalog::load(buffer_pool.clone())?;
+
+        // 位图不信任磁盘旧值：以 Catalog 为权威重建，顺手回收崩溃留下的孤儿页
+        catalog.rebuild_free_bitmap(&mut free_mgr);
+        free_mgr.flush(&buffer_pool)?;
 
         Ok(Self { buffer_pool, catalog, free_mgr, file_header, log_manager,txn_mgr })
     }

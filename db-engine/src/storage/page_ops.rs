@@ -57,7 +57,7 @@ impl WalContext {
     }
 
     /// 记录一次"页内字节区间写入"：before 必须已抓取，after 是即将写入的字节（二者等长）。
-    fn log_write(&mut self, page_id: PageId, offset: usize, before: Vec<u8>, after: &[u8]) -> Lsn {
+    pub(crate) fn log_write(&mut self, page_id: PageId, offset: usize, before: Vec<u8>, after: &[u8]) -> Lsn {
         debug_assert_eq!(before.len(), after.len(), "物理日志要求 before/after 等长");
         let rec = LogRecord::Update {
             txn_id: self.txn_id,

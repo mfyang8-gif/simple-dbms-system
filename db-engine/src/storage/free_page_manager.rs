@@ -35,7 +35,11 @@ impl FreePageManager {
         }
     }
 
-
+    /// 清空位图，全部标记为“空闲”。
+    /// 只在恢复期重建派生状态时使用：位图不是权威数据，Catalog 才是。
+    pub fn reset(&mut self) {
+        self.bitmap.iter_mut().for_each(|b| *b = 0);
+    }
     pub fn total_pages(&self) -> u32 {
         self.max_pages
     }

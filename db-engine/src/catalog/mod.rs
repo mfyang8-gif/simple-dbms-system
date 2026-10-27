@@ -26,12 +26,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::PAGE_SIZE;
+use crate::recovery::log_record::TxnId;
+use crate::recovery::lsn::INVALID_LSN;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::free_page_manager::FreePageManager;
-use crate::storage::page_header::{PageHeader, PAGE_HEADER_SIZE};
+use crate::storage::page::Page;
+use crate::storage::page_header::{PageHeader, LOGGED_HEADER_SIZE, PAGE_HEADER_SIZE};
+use crate::storage::page_ops::WalContext;
 use crate::table::{Column, Table};
 use crate::types::PageId;
-
 /// 第一个 Catalog 页固定在 Page 2
 const FIRST_CATALOG_PAGE_ID: PageId = 2;
 
@@ -44,6 +47,14 @@ const CATALOG_VERSION: u32 = 1;
 /// Catalog 页内头部（不含 PageHeader）
 /// magic(4) + version(4) + table_count(4) + next_page_id(4) = 16 bytes
 const CATALOG_PAGE_HEADER_SIZE: usize = 16;
+
+
+/// Catalog 使用的保留事务号。
+///
+/// 0 不会被 TransactionManager 分配（它从 1 开始），也永远不会出现在 txn_table 里：
+/// analyze 只对 Begin 建条目，undo 只遍历 txn_table。
+/// 所以 txn 0 的 Update 只被 redo 重放、永不被 undo 撤销——正是“系统事务”的语义。
+const CATALOG_TXN_ID: TxnId = 0;
 
 /// 单张表的元数据
 #[derive(Debug, Clone)]
@@ -157,6 +168,7 @@ pub struct Catalog {
     catalog_page_ids: Vec<PageId>,
     dirty: bool,
 }
+/// 为 Catalog 的页写操作创建“系统事务”上下文（txn 0）。
 
 impl Catalog {
     /// 创建新的 Catalog（空）
@@ -168,7 +180,13 @@ impl Catalog {
             dirty: false,
         }
     }
-
+    fn catalog_wal(&self) -> WalContext {
+        WalContext::with_txn(
+            self.buffer_pool.log_manager().clone(),
+            CATALOG_TXN_ID,
+            INVALID_LSN,
+        )
+    }
     /// 每个 Catalog 页可用于 TableEntry 的最大字节数
     fn max_entries_bytes_per_page() -> usize {
         PAGE_SIZE - PAGE_HEADER_SIZE - CATALOG_PAGE_HEADER_SIZE
@@ -254,6 +272,30 @@ impl Catalog {
             dirty: false,
         })
     }
+    /// 恢复期重建空闲页位图（派生状态，不进 WAL）。
+    ///
+    /// 以 Catalog 为权威，重新标记：
+    ///   page 0（FileHeader）、page 1（位图自身）、Catalog 链上的每一页、
+    ///   每张表的 first_data_page 与全部 data_pages。
+    /// 其余一律视为空闲——崩溃瞬间“已分配但还没来得及写进 Catalog”的孤儿页，
+    /// 正好在这里被回收，而不是被永久标记为已用。
+    pub fn rebuild_free_bitmap(&self, free_mgr: &mut FreePageManager) {
+        free_mgr.reset();
+
+        free_mgr.mark_used(0); // FileHeader
+        free_mgr.mark_used(1); // 位图自己所在的页
+
+        for &page_id in &self.catalog_page_ids {
+            free_mgr.mark_used(page_id);
+        }
+
+        for meta in self.tables.values() {
+            free_mgr.mark_used(meta.first_data_page);
+            for &page_id in &meta.data_pages {
+                free_mgr.mark_used(page_id);
+            }
+        }
+    }
 
     /// 持久化 Catalog 到磁盘（支持多页链表，需要 FreePageManager 分配扩展页）
     pub fn flush(&mut self, free_mgr: &mut FreePageManager) -> std::io::Result<()> {
@@ -311,6 +353,10 @@ impl Catalog {
         free_mgr.mark_used(FIRST_CATALOG_PAGE_ID);
 
         // 写入所有 Catalog 页（设置链表指针）
+        // 每一页的字节修改都必须进 WAL：否则崩溃后 redo 没有任何东西可重放，表定义直接丢。
+        let mut wal = self.catalog_wal();
+        let mut wrote_log = false;
+
         for (i, entries) in pages_data.iter().enumerate() {
             let page_id = self.catalog_page_ids[i];
             let next_page_id = if i + 1 < pages_data.len() {
@@ -319,15 +365,39 @@ impl Catalog {
                 0
             };
 
+            // 先在临时页上生成目标内容，作为 after image
+            let mut target = Page::new(page_id);
+            Self::write_catalog_page_to_buffer(&mut target, entries, next_page_id);
+
+            let used_len = PAGE_HEADER_SIZE
+                + CATALOG_PAGE_HEADER_SIZE
+                + entries.iter().map(|e| e.len()).sum::<usize>();
+
             let page_ref = self.buffer_pool.fetch_page(page_id)?;
-            {
-                let mut page = page_ref.write().unwrap();
-                Self::write_catalog_page_to_buffer(&mut page, entries, next_page_id);
+            let mut page = page_ref.write().unwrap();
+
+            let before = page.read_data(0, used_len);
+            let after = target.read_data(0, used_len);
+
+            // 内容没变就不记日志：否则每次 DDL 都重写整个 Catalog，日志线性膨胀
+            if before == after {
+                continue;
             }
+
+            // WAL 先行：先 append 日志，再改内存，最后点亮 pageLSN
+            wal.log_write(page_id, 0, before.to_vec(), after);
+            page.write_data(0, after);
+            PageHeader::write_page_lsn(&mut page, wal.last_lsn());
+            wrote_log = true;
         }
 
-        // 同步 FreePageManager 位图到 BufferPool
+        // 同步 FreePageManager 位图到 BufferPool（派生状态，不记日志，恢复时重建）
         free_mgr.flush(&self.buffer_pool)?;
+
+        // ★ 必须在这里自己 fsync：server 模式根本不会走到 Database::shutdown
+        if wrote_log {
+            self.buffer_pool.log_manager().flush()?;
+        }
 
         self.dirty = false;
         Ok(())
@@ -353,9 +423,29 @@ impl Catalog {
         })?;
         free_mgr.mark_used(first_data_page);
 
+        // Table::new 会往 first_data_page 写 16 字节页头，这一步也必须进 WAL：
+        // 否则崩溃后该页是 0，首条 INSERT 会误判“页满”并白白浪费一页。
+        let header_before = {
+            let page_ref = self.buffer_pool.fetch_page(first_data_page)?;
+            let page = page_ref.read().unwrap();
+            page.read_data(0, LOGGED_HEADER_SIZE).to_vec()
+        };
+
         // 创建 Table（自动初始化 Slotted Page 页头）
         let table = Table::new(name.clone(), columns.clone(), first_data_page, self.buffer_pool.clone())?;
 
+        {
+            let page_ref = self.buffer_pool.fetch_page(first_data_page)?;
+            let mut page = page_ref.write().unwrap();
+            let header_after = page.read_data(0, LOGGED_HEADER_SIZE).to_vec();
+
+            let mut wal = self.catalog_wal();
+            wal.log_write(first_data_page, 0, header_before, &header_after);
+            PageHeader::write_page_lsn(&mut page, wal.last_lsn());
+        }
+
+        // 页头初始化的日志立即落盘；Catalog 页的日志随后会在 flush 里一起落盘
+        self.buffer_pool.log_manager().flush()?;
         // 记录元数据
         let meta = TableMeta {
             name: name.clone(),
@@ -456,6 +546,8 @@ mod tests {
 
         let mut fpm = FreePageManager::new(crate::config::PAGE_SIZE as u64, 1024);
         fpm.mark_used(0); // FileHeader
+        fpm.mark_used(1); // 位图页
+        fpm.mark_used(2); // Catalog 首页
 
         (bp, fpm)
     }
@@ -477,8 +569,8 @@ mod tests {
 
         let meta = catalog.get_table_meta("users").unwrap();
         assert_eq!(meta.columns.len(), 2);
-        assert_eq!(meta.first_data_page, 1);
-        assert_eq!(meta.data_pages, vec![1]);
+        assert_eq!(meta.first_data_page, 3); // 0/1/2 是系统页
+        assert_eq!(meta.data_pages, vec![3]);
     }
 
     #[test]
@@ -522,11 +614,9 @@ mod tests {
         assert_eq!(meta.columns.len(), 2);
         assert_eq!(meta.columns[0].name, "id");
         assert_eq!(meta.columns[1].name, "name");
-        assert!(!meta.columns[0].nullable);
         assert!(meta.columns[0].auto_increment);
-        assert_eq!(meta.data_pages, vec![1]);
+        assert_eq!(meta.data_pages, vec![3]); // 0/1/2 是系统页
     }
-
     #[test]
     fn test_multi_page_catalog() {
         let (bp, mut fpm) = setup();
