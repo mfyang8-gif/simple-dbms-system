@@ -24,15 +24,26 @@ impl DiskManager {
     ///
     /// 如果文件不存在会自动创建，同时确保父目录存在。
     pub fn new() -> std::io::Result<Self> {
-        if let Some(parent) = std::path::Path::new(DB_FILE).parent() {
-            std::fs::create_dir_all(parent)?;
+        Self::open_at(DB_FILE)
+    }
+
+    /// 打开或创建指定路径的数据库文件。
+    ///
+    /// 主要给测试隔离用：e2e 测试可以用自己的临时文件，
+    /// 不再删生产库 ./data/db.db。
+    pub fn open_at(path: &str) -> std::io::Result<Self> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            // 路径不带目录时 parent 是空串，create_dir_all("") 会报错
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
 
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(DB_FILE)?;
+            .open(path)?;
 
         Ok(Self { file })
     }

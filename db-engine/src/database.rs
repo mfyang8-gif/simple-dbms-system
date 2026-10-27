@@ -31,23 +31,34 @@ pub struct Database {
     /// WAL 日志管理器（Slice B 中 page_ops 写日志要用）
     log_manager: Arc<LogManager>,
     txn_mgr: Arc<Mutex<TransactionManager>>,
+    /// 当前实例的 WAL 文件路径（ROLLBACK 的运行时 undo 要读它）
+    log_path: String,
 }
 
 impl Database {
-    /// 打开或创建数据库（自动判断是新建还是打开已有）
+    /// 打开或创建数据库（使用全局默认路径）
     pub fn open() -> std::io::Result<Self> {
-        let disk_manager = DiskManager::new()?;
+        Self::open_at(crate::config::DB_FILE, crate::config::LOG_FILE)
+    }
+
+    /// 打开或创建指定路径的数据库。
+    ///
+    /// 把 db 文件与 WAL 文件的路由从全局配置里抽出来：
+    ///   - 测试可以用独立文件，不再删生产库；
+    ///   - 以后做多库（CREATE DATABASE / USE）也只需要在这里分派路径。
+    pub fn open_at(db_path: &str, log_path: &str) -> std::io::Result<Self> {
+        let disk_manager = DiskManager::open_at(db_path)?;
         let is_new = disk_manager.is_empty()?;
-        let log_manager = Arc::new(LogManager::new()?);
+        let log_manager = Arc::new(LogManager::from_path(log_path)?);
 
         if is_new {
             let mut dm = disk_manager;
             dm.preallocate(RESERVED_PAGES)?;
             let bp = Arc::new(BufferPool::new(dm, log_manager.clone()));
-            Self::init_new(bp, log_manager)
+            Self::init_new(bp, log_manager, log_path)
         } else {
             let bp = Arc::new(BufferPool::new(disk_manager, log_manager.clone()));
-            Self::load_existing(bp, log_manager)
+            Self::load_existing(bp, log_manager, log_path)
         }
     }
 
@@ -60,7 +71,7 @@ impl Database {
         table.insert_row(row, &mut self.free_mgr, &mut self.catalog, &self.txn_mgr, txn)
     }
     /// 首次创建：初始化所有系统页
-    fn init_new(buffer_pool: Arc<BufferPool>, log_manager: Arc<LogManager>) -> std::io::Result<Self> {
+    fn init_new(buffer_pool: Arc<BufferPool>, log_manager: Arc<LogManager>, log_path: &str) -> std::io::Result<Self> {
         let txn_mgr = Arc::new(Mutex::new(TransactionManager::new(log_manager.clone())));
 
         // Page 0: FileHeader
@@ -84,11 +95,11 @@ impl Database {
         //   若在 shutdown 之前退出，下次 open 会看到“文件非空 + magic=0”，被误判成已有库。
         buffer_pool.flush()?;
 
-        Ok(Self { buffer_pool, catalog, free_mgr, file_header, log_manager, txn_mgr })
+        Ok(Self { buffer_pool, catalog, free_mgr, file_header, log_manager, txn_mgr, log_path: log_path.to_string() })
     }
 
     /// 从已有数据库文件恢复
-    fn load_existing(buffer_pool: Arc<BufferPool>, log_manager: Arc<LogManager>) -> std::io::Result<Self> {
+    fn load_existing(buffer_pool: Arc<BufferPool>, log_manager: Arc<LogManager>, log_path: &str) -> std::io::Result<Self> {
         let txn_mgr = Arc::new(Mutex::new(TransactionManager::new(log_manager.clone())));
         // Page 0: 读取 FileHeader
         let page0 = buffer_pool.fetch_page(0)?;
@@ -98,7 +109,7 @@ impl Database {
         let mut free_mgr = FreePageManager::new(PAGE_SIZE as u64, MAX_PAGES);
 
         // 先 redo/undo：把所有已提交的页修改重放进 buffer pool
-        crate::recovery::restore::restore(&crate::config::LOG_FILE, &buffer_pool, &log_manager)?;
+        crate::recovery::restore::restore(log_path, &buffer_pool, &log_manager)?;
 
         // Page 2+: 从（可能已被 redo 修正过的）页里恢复 Catalog
         let catalog = Catalog::load(buffer_pool.clone())?;
@@ -107,7 +118,7 @@ impl Database {
         catalog.rebuild_free_bitmap(&mut free_mgr);
         free_mgr.flush(&buffer_pool)?;
 
-        Ok(Self { buffer_pool, catalog, free_mgr, file_header, log_manager,txn_mgr })
+        Ok(Self { buffer_pool, catalog, free_mgr, file_header, log_manager, txn_mgr, log_path: log_path.to_string() })
     }
 
     // ==================== DDL ====================
@@ -173,6 +184,8 @@ impl Database {
     /// 获取内部组件引用（Table 的 insert/delete 需要用到）
     pub fn buffer_pool(&self) -> &Arc<BufferPool> { &self.buffer_pool }
     pub fn log_manager(&self) -> &Arc<LogManager> { &self.log_manager }
+    /// 当前实例的 WAL 路径（测试隔离后不能再用全局 config::LOG_FILE）
+    pub fn log_path(&self) -> &str { &self.log_path }
     pub fn catalog_mut(&mut self) -> &mut Catalog { &mut self.catalog }
     pub fn free_mgr_mut(&mut self) -> &mut FreePageManager { &mut self.free_mgr }
     pub fn txn_mgr(&self) -> &Arc<Mutex<TransactionManager>> { &self.txn_mgr }

@@ -182,7 +182,7 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
                 last_lsn,
                 db.buffer_pool(),
                 db.log_manager(),
-                crate::config::LOG_FILE,
+                db.log_path(),
             ).map_err(|e| format!("rollback failed: {}", e))?;
 
             // 写 Abort 日志 + 从活跃表摘除
@@ -267,10 +267,18 @@ fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, d
 ///
 /// 注意：不能用 `position(|c| c == name)` 一把梭——那会静默取第一个同名列。
 fn resolve_column(name: &str, col_names: &[String]) -> Result<usize, String> {
+    // ① 精确匹配：多表时是 "users.id"，单表时是裸名 "id"
     if let Some(i) = col_names.iter().position(|c| c == name) {
         return Ok(i);
     }
 
+    // ② 带前缀却没精确命中 → 表名写错或该表没这列，不能按短名回退。
+    //    否则 "other.name" 会在单表里被误认成 "name"。
+    if name.contains('.') {
+        return Err(format!("column '{}' not found", name));
+    }
+
+    // ③ 裸名 → 短名匹配 + 歧义检测
     let hits: Vec<usize> = col_names
         .iter()
         .enumerate()
@@ -284,7 +292,6 @@ fn resolve_column(name: &str, col_names: &[String]) -> Result<usize, String> {
         _ => Err(format!("ambiguous column '{}'", name)),
     }
 }
-
 /// "users.id" → "id"；本来就是裸名则原样返回
 fn short_name(full: &str) -> &str {
     full.rsplit_once('.').map(|(_, c)| c).unwrap_or(full)
@@ -477,16 +484,12 @@ fn execute_select(
             .map_err(|e| format!("open_table '{}' failed: {}", j.table, e))?;
         tables.push((j.table.clone(), t));
     }
-
-    // ② 列名空间：多表用 "表名.列名"，单表保持裸名（不破坏现有测试和 Java 客户端）
+    // ② 列名空间：一律 "表名.列名"。
+    //    这样单表写 j_a.name 也能精确命中（标准 SQL），不用靠短名猜。
     let mut col_names: Vec<String> = Vec::new();
     for (tname, t) in &tables {
         for c in &t.columns {
-            col_names.push(if multi {
-                format!("{}.{}", tname, c.name)
-            } else {
-                c.name.clone()
-            });
+            col_names.push(format!("{}.{}", tname, c.name));
         }
     }
     let width = col_names.len();
@@ -563,8 +566,17 @@ fn execute_select(
         .iter()
         .map(|vals| proj.iter().map(|&i| vals[i].to_cell()).collect())
         .collect();
-    let out_col_names: Vec<String> = proj.iter().map(|&i| col_names[i].clone()).collect();
-
+    // 单表输出裸列名（与旧版一致），多表输出 "表名.列名"
+    let out_col_names: Vec<String> = proj
+        .iter()
+        .map(|&i| {
+            if multi {
+                col_names[i].clone()
+            } else {
+                short_name(&col_names[i]).to_string()
+            }
+        })
+        .collect();
     Ok(ResultSet::Rows { columns: out_col_names, rows })
 }
 // 删除 WHERE 为 TRUE 的行（无 WHERE 时删全表）
@@ -741,6 +753,19 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())  // 前一个测试 panic 不该连坐
     }
 
+    /// e2e 测试专用库：与生产 ./data/db.db 完全隔离。
+    ///
+    /// 以前每个测试都 remove_file(config::DB_FILE)，跑一趟 cargo test 就会把
+    /// 手工建的库全删掉。现在所有 e2e 统一走这两个文件，生产库不再被碰。
+    const TEST_DB: &str = "./data/test_executor.db";
+    const TEST_LOG: &str = "./data/test_executor.log";
+
+    fn open_test_db() -> Database {
+        let _ = std::fs::remove_file(TEST_DB);
+        let _ = std::fs::remove_file(TEST_LOG);
+        Database::open_at(TEST_DB, TEST_LOG).expect("open test db")
+    }
+
     /// 测试断言辅助：一个单元格 Option<String> → 可读字符串（NULL 就写成 "NULL"）。
     /// 这样断言仍然能写成 `cell(&rows[0][2]) == "Alice"`，不用到处 `unwrap()`。
     fn cell(c: &Option<String>) -> String {
@@ -760,7 +785,7 @@ mod tests {
     #[test]
     fn test_e2e_create_and_insert() {
         let _guard = db_lock();
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         // 1. 建表
@@ -791,10 +816,7 @@ mod tests {
     #[test]
     fn test_e2e_select_star() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE q_users (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
@@ -817,10 +839,7 @@ mod tests {
     #[test]
     fn test_e2e_select_where_gt() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE w_emp (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
@@ -843,10 +862,7 @@ mod tests {
     #[test]
     fn test_e2e_select_where_and_like() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE w_emp2 (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
@@ -871,10 +887,7 @@ mod tests {
     #[test]
     fn test_select_unknown_column_errors() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE w_bad (id INT PRIMARY KEY)").unwrap();
@@ -889,10 +902,7 @@ mod tests {
     #[test]
     fn test_e2e_select_projection() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE p_emp (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
@@ -923,10 +933,7 @@ mod tests {
     #[test]
     fn test_e2e_delete() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE d_emp (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
@@ -952,9 +959,7 @@ mod tests {
     #[test]
     fn test_e2e_begin_commit() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE t_emp (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
@@ -975,9 +980,7 @@ mod tests {
     #[test]
     fn test_e2e_rollback_undoes_insert() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE r_emp (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
@@ -998,9 +1001,7 @@ mod tests {
     #[test]
     fn test_e2e_rollback_undoes_delete() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE r_emp2 (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
@@ -1024,9 +1025,7 @@ mod tests {
     #[test]
     fn test_e2e_update_where() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE u_emp (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
@@ -1063,9 +1062,7 @@ mod tests {
     #[test]
     fn test_e2e_update_rollback() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE ur_emp (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
@@ -1099,9 +1096,7 @@ mod tests {
     #[test]
     fn test_e2e_select_order_by() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE o_emp (id INT PRIMARY KEY, age INT, name VARCHAR(50))").unwrap();
@@ -1171,9 +1166,7 @@ mod tests {
     #[test]
     fn test_e2e_null_roundtrip_and_is_null() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session,
@@ -1212,9 +1205,7 @@ mod tests {
     #[test]
     fn test_e2e_not_null_rejects_null() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session,
@@ -1241,9 +1232,7 @@ mod tests {
     #[test]
     fn test_e2e_three_valued_logic_where() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE t3 (id INT PRIMARY KEY, age INT)").unwrap();
@@ -1279,9 +1268,7 @@ mod tests {
     #[test]
     fn test_e2e_update_set_null() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session,
@@ -1318,9 +1305,7 @@ mod tests {
     #[test]
     fn test_e2e_order_by_null_position() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE o5 (id INT PRIMARY KEY, age INT)").unwrap();
@@ -1348,9 +1333,7 @@ mod tests {
     #[test]
     fn test_e2e_delete_where_null() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session, "CREATE TABLE d6 (id INT PRIMARY KEY, age INT)").unwrap();
@@ -1375,9 +1358,7 @@ mod tests {
     #[test]
     fn test_e2e_insert_column_list() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session,
@@ -1415,9 +1396,7 @@ mod tests {
     #[test]
     fn test_e2e_default_fill() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session,
@@ -1453,9 +1432,7 @@ mod tests {
     #[test]
     fn test_e2e_unique_constraint() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session,
@@ -1481,10 +1458,7 @@ mod tests {
     #[test]
     fn test_e2e_join_two_tables() {
         let _guard = db_lock();
-        let _ = std::fs::remove_file(crate::config::DB_FILE);
-        let _ = std::fs::remove_file(crate::config::LOG_FILE);
-
-        let mut db = Database::open().unwrap();
+        let mut db = open_test_db();
         let mut session = Session::new();
 
         exec_sql(&mut db, &mut session,
@@ -1544,6 +1518,20 @@ mod tests {
             ResultSet::Rows { columns, .. } => assert_eq!(columns, vec!["j_orders.amount"]),
             other => panic!("expected Rows, got {:?}", other),
         }
+
+        // ⑤ 单表写限定名：标准 SQL 允许，输出列名仍是裸名
+        let r = exec_sql(&mut db, &mut session, "SELECT j_users.name FROM j_users").unwrap();
+        match r {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name"]);
+                assert_eq!(rows.len(), 2);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // ⑥ 错误前缀不能被短名兜住（否则 other.name 会误命中 name）
+        let err = exec_sql(&mut db, &mut session, "SELECT nope.name FROM j_users").unwrap_err();
+        assert!(err.contains("not found"), "got: {}", err);
 
         let _ = db.shutdown();
     }
