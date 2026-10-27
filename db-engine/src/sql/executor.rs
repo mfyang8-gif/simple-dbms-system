@@ -154,7 +154,9 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
         }
         Statement::DropTable { name } => execute_drop_table(name, db),
         Statement::Insert { table, columns, values } => execute_insert(table, columns, values, db, session),
-        Statement::Select { columns, table, filter, order_by, .. } => execute_select(columns, table, filter, order_by, db),
+        Statement::Select { columns, table, joins,filter, order_by, .. }=> {
+            execute_select(columns, table, joins, filter, order_by, db)
+        },
         Statement::Delete { table, filter } => execute_delete(table, filter, db, session),
         Statement::Begin => {
             if session.txn_id.is_some() {
@@ -254,14 +256,56 @@ fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, d
         .map_err(|e| format!("insert failed: {}", e))?;
     Ok(ResultSet::Affected(1))
 }
-// 评估标量表达式（列名查表 → 下标 → 从当前行取值）
+/// 在列名空间里解析一个列引用 → 下标。
+///
+/// 规则（JOIN 名称解析的全部内容）：
+///   1. 先按完整名精确匹配：多表时列名空间是 ["users.id", "users.name", "orders.id"]
+///   2. 再按短名匹配（去掉 "表名." 前缀）：
+///        命中 0 个 → not found
+///        命中 1 个 → 放行（单表写 users.id 也靠这条兜底）
+///        命中 >=2 → ambiguous
+///
+/// 注意：不能用 `position(|c| c == name)` 一把梭——那会静默取第一个同名列。
+fn resolve_column(name: &str, col_names: &[String]) -> Result<usize, String> {
+    if let Some(i) = col_names.iter().position(|c| c == name) {
+        return Ok(i);
+    }
+
+    let hits: Vec<usize> = col_names
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| short_name(c) == name)
+        .map(|(i, _)| i)
+        .collect();
+
+    match hits.len() {
+        0 => Err(format!("column '{}' not found", name)),
+        1 => Ok(hits[0]),
+        _ => Err(format!("ambiguous column '{}'", name)),
+    }
+}
+
+/// "users.id" → "id"；本来就是裸名则原样返回
+fn short_name(full: &str) -> &str {
+    full.rsplit_once('.').map(|(_, c)| c).unwrap_or(full)
+}
+/// 评估标量表达式（列名查表 → 下标 → 从当前行取值）
 fn eval_scalar(e: &Expr, col_names: &[String], vals: &[Value]) -> Result<Value, String> {
     match e {
+        // 裸列名：单表时唯一；JOIN 里同名列会在这里报 ambiguous
         Expr::Column(name) => {
-            // 列名查表 → 下标 → 从当前行取值。查不到 = 列不存在（Q3 的第三道防线）
-            let idx = col_names.iter().position(|c| c == name)
-                .ok_or_else(|| format!("column '{}' not found", name))?;
-            Ok(vals[idx].clone())
+            let idx = resolve_column(name, col_names)?;
+            let v = vals.get(idx)
+                .ok_or_else(|| format!("column '{}' is not available yet", name))?;
+            Ok(v.clone())
+        }
+        // 限定列 users.id：JOIN 的标准写法，精确命中，永远不会歧义
+        Expr::QualifiedColumn { table, col } => {
+            let full = format!("{}.{}", table, col);
+            let idx = resolve_column(&full, col_names)?;
+            let v = vals.get(idx)
+                .ok_or_else(|| format!("column '{}' is not available yet", full))?;
+            Ok(v.clone())
         }
         Expr::Literal(LitValue::Number(n)) => Ok(Value::Int(*n)),
         Expr::Literal(LitValue::Str(s)) => Ok(Value::Str(s.clone())),
@@ -269,7 +313,6 @@ fn eval_scalar(e: &Expr, col_names: &[String], vals: &[Value]) -> Result<Value, 
         other => Err(format!("unsupported scalar: {:?}", other)),
     }
 }
-
 /// 比较两个值。只要有一边是 NULL，结果就是 unknown（不是 false）。
 fn compare(l: &Value, op: &BinOp, r: &Value) -> Result<Tri, String> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
@@ -362,25 +405,134 @@ fn cmp_for_sort(a: &Value, b: &Value) -> Ordering {
         (Value::Str(_), Value::Int(_)) => Ordering::Greater,
     }
 }
+// 求值一条 JOIN 的 ON 条件（当前只支持等值）。
+/// 内连接语义：任一边是 NULL 都算“不匹配”——NULL = NULL 是 unknown，不是 true。
+fn eval_join_cond(join: &JoinClause, col_names: &[String], vals: &[Value]) -> Result<bool, String> {
+    let li = resolve_column(&join.left_col, col_names)?;//
+    let ri = resolve_column(&join.right_col, col_names)?;
 
-fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<Expr>, order_by: Vec<OrderByItem>, db: &mut Database) -> Result<ResultSet, String> {
-    let table = db.open_table(&table_name)
-        .map_err(|e| format!("open_table failed: {}", e))?;
+    let l = vals.get(li)
+        .ok_or_else(|| format!("JOIN ON references a table not joined yet: {}", join.left_col))?;
+    let r = vals.get(ri)
+        .ok_or_else(|| format!("JOIN ON references a table not joined yet: {}", join.right_col))?;
 
-    // 全列名（schema 顺序）
-    let all_col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(false);
+    }
+    Ok(l == r)
+}
 
-    // ★ 5.4-c：决定投影下标（"要输出哪几列"）
+/// 递归拼接：depth = “正在接第几张表”（tables[0] 是主表）。
+/// 接第 depth 张表时，用 joins[depth-1] 剪枝；接完所有表就把当前组合收进 out。
+fn join_dfs(
+    rows_by_table: &[Vec<Vec<Value>>],
+    joins: &[JoinClause],
+    depth: usize,
+    current: &mut Vec<Value>,
+    col_names: &[String],
+    out: &mut Vec<Vec<Value>>,
+) -> Result<(), String> {
+    if depth == rows_by_table.len() {
+        out.push(current.clone());
+        return Ok(());
+    }
+
+    for row in &rows_by_table[depth] {
+        let saved = current.len();
+        current.extend_from_slice(row);
+
+        let matched = if depth == 0 {
+            true   // 主表不需要 ON
+        } else {
+            eval_join_cond(&joins[depth - 1], col_names, current)?
+        };
+
+        if matched {
+            join_dfs(rows_by_table, joins, depth + 1, current, col_names, out)?;
+        }
+        // 回溯：把这张表的值摘掉，换下一行
+        current.truncate(saved);
+    }
+    Ok(())
+}
+fn execute_select(
+    columns: Vec<SelectItem>,
+    table_name: String,
+    joins: Vec<JoinClause>,
+    filter: Option<Expr>,
+    order_by: Vec<OrderByItem>,
+    db: &mut Database,
+) -> Result<ResultSet, String> {
+    let multi = !joins.is_empty();
+
+    // ① 打开所有表：主表在前，JOIN 表按书写顺序跟在后面
+    let mut tables: Vec<(String, Table)> = Vec::with_capacity(joins.len() + 1);
+    tables.push((
+        table_name.clone(),
+        db.open_table(&table_name)
+            .map_err(|e| format!("open_table failed: {}", e))?,
+    ));
+    for j in &joins {
+        let t = db.open_table(&j.table)
+            .map_err(|e| format!("open_table '{}' failed: {}", j.table, e))?;
+        tables.push((j.table.clone(), t));
+    }
+
+    // ② 列名空间：多表用 "表名.列名"，单表保持裸名（不破坏现有测试和 Java 客户端）
+    let mut col_names: Vec<String> = Vec::new();
+    for (tname, t) in &tables {
+        for c in &t.columns {
+            col_names.push(if multi {
+                format!("{}.{}", tname, c.name)
+            } else {
+                c.name.clone()
+            });
+        }
+    }
+    let width = col_names.len();
+
+    // ③ 逐表扫描 + 解码。存储层到这里就够了：scan_all 交出全部行
+    let mut rows_by_table: Vec<Vec<Vec<Value>>> = Vec::with_capacity(tables.len());
+    for (_, t) in &tables {
+        let scanned = t.scan_all().map_err(|e| format!("scan_all failed: {}", e))?;
+        let mut rows = Vec::with_capacity(scanned.len());
+        for (_, rec) in &scanned {
+            rows.push(decode_row(t, rec)?);
+        }
+        rows_by_table.push(rows);
+    }
+
+    // ④ 拼接：单表直接取，多表走带 ON 剪枝的嵌套循环
+    let mut decoded: Vec<Vec<Value>> = Vec::new();
+    if multi {
+        let mut cur: Vec<Value> = Vec::with_capacity(width);
+        join_dfs(&rows_by_table, &joins, 0, &mut cur, &col_names, &mut decoded)?;
+    } else {
+        decoded = rows_by_table.pop().unwrap_or_default();
+    }
+
+    // ⑤ WHERE：在拼接后的完整行上求值（先筛行，后删列）
+    if let Some(f) = &filter {
+        let mut kept = Vec::with_capacity(decoded.len());
+        for vals in decoded {
+            if eval_expr(f, &col_names, &vals)? == Tri::True {
+                kept.push(vals);
+            }
+        }
+        decoded = kept;
+    }
+
+    // ⑥ 投影：Star → 全列；Column → 短名解析；TableColumn → 限定名解析
     let proj: Vec<usize> = match &columns[..] {
-        [SelectItem::Star] => (0..all_col_names.len()).collect(),   // * → 全列
+        [SelectItem::Star] => (0..width).collect(),
         items => {
-            let mut idxs = Vec::new();
+            let mut idxs = Vec::with_capacity(items.len());
             for item in items {
                 match item {
-                    SelectItem::Column(name) => {
-                        let i = all_col_names.iter().position(|c| c == name)
-                            .ok_or_else(|| format!("column '{}' not found", name))?;
-                        idxs.push(i);
+                    SelectItem::Column(name) => idxs.push(resolve_column(name, &col_names)?),
+                    SelectItem::TableColumn { table, col } => {
+                        let full = format!("{}.{}", table, col);
+                        idxs.push(resolve_column(&full, &col_names)?);
                     }
                     other => return Err(format!("unsupported select item: {:?}", other)),
                 }
@@ -389,31 +541,11 @@ fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<E
         }
     };
 
-    // 先把 ORDER BY 的列名解析成下标（提前报错，不拖到扫完）
+    // ⑦ ORDER BY（在投影之前排序：可能按没被 SELECT 的列排）
     let mut sort_keys: Vec<(usize, bool)> = Vec::new();
     for item in &order_by {
-        let i = all_col_names.iter().position(|c| c == &item.column)
-            .ok_or_else(|| format!("column '{}' not found in ORDER BY", item.column))?;
-        sort_keys.push((i, item.asc));
+        sort_keys.push((resolve_column(&item.column, &col_names)?, item.asc));
     }
-
-    // 全表扫描
-    let out_rows = table.scan_all().map_err(|e| format!("scan_all failed: {}", e))?;
-
-    // 逐行：解码 → 过滤（用全列），先不投影（ORDER BY 可能引用不在 SELECT 里的列）
-    let mut decoded: Vec<Vec<Value>> = Vec::new();
-    for (_row_id, record) in &out_rows {
-        let vals = decode_row(&table, record)?;
-        if let Some(f) = &filter {
-            // WHERE 只保留为 TRUE 的行：FALSE 和 UNKNOWN（ NULL 参与）都丢掉
-            if eval_expr(f, &all_col_names, &vals)? != Tri::True {
-                continue;
-            }
-        }
-        decoded.push(vals);
-    }
-
-    // 排序（在投影之前，直接用源表列的值比较）
     if !sort_keys.is_empty() {
         decoded.sort_by(|a, b| {
             for &(idx, asc) in &sort_keys {
@@ -426,15 +558,12 @@ fn execute_select(columns: Vec<SelectItem>, table_name: String, filter: Option<E
         });
     }
 
-    // 投影（只取 proj 下标）；NULL 以 None 输出，不能跟字符串 "NULL" 混为一谈
-    let rows: Vec<Vec<Option<String>>> = decoded.iter()
+    // ⑧ 投影落地 + 输出列名（多表时就是 "表名.列名"）
+    let rows: Vec<Vec<Option<String>>> = decoded
+        .iter()
         .map(|vals| proj.iter().map(|&i| vals[i].to_cell()).collect())
         .collect();
-
-    // 输出的列名也只保留投影的
-    let out_col_names: Vec<String> = proj.iter()
-        .map(|&i| all_col_names[i].clone())
-        .collect();
+    let out_col_names: Vec<String> = proj.iter().map(|&i| col_names[i].clone()).collect();
 
     Ok(ResultSet::Rows { columns: out_col_names, rows })
 }
@@ -1344,6 +1473,76 @@ mod tests {
         match exec_sql(&mut db, &mut session, "SELECT id FROM uq ORDER BY id").unwrap() {
             ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 3, "一行 A + 两行 NULL code"),
             other => panic!("got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_join_two_tables() {
+        let _guard = db_lock();
+        let _ = std::fs::remove_file(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(crate::config::LOG_FILE);
+
+        let mut db = Database::open().unwrap();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE j_users (id INT PRIMARY KEY, name VARCHAR(20))").unwrap();
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE j_orders (id INT PRIMARY KEY, user_id INT, amount INT)").unwrap();
+
+        exec_sql(&mut db, &mut session, "INSERT INTO j_users VALUES (1, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO j_users VALUES (2, 'Bob')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO j_orders VALUES (10, 1, 100)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO j_orders VALUES (11, 1, 200)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO j_orders VALUES (12, 2, 50)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO j_orders VALUES (13, 3, 70)").unwrap();
+
+        // ① SELECT *：5 列、3 行（Alice 两条订单，user_id=3 无匹配被丢弃）
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT * FROM j_users JOIN j_orders ON j_users.id = j_orders.user_id").unwrap();
+        match r {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec![
+                    "j_users.id", "j_users.name",
+                    "j_orders.id", "j_orders.user_id", "j_orders.amount",
+                ]);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(cells(&rows[0]), vec!["1", "Alice", "10", "1", "100"]);
+                assert_eq!(cells(&rows[1]), vec!["1", "Alice", "11", "1", "200"]);
+                assert_eq!(cells(&rows[2]), vec!["2", "Bob", "12", "2", "50"]);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // ② 限定列投影 + WHERE + ORDER BY（JOIN 后依然先筛行后删列）
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT j_users.name, j_orders.amount FROM j_users JOIN j_orders \
+             ON j_users.id = j_orders.user_id WHERE j_orders.amount > 60 \
+             ORDER BY j_orders.amount DESC").unwrap();
+        match r {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["j_users.name", "j_orders.amount"]);
+                assert_eq!(cells_all(&rows), vec![
+                    vec!["Alice".to_string(), "200".to_string()],
+                    vec!["Alice".to_string(), "100".to_string()],
+                ]);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // ③ 裸 id 在两表都存在 → 必须报歧义，不能静默取第一个
+        let err = exec_sql(&mut db, &mut session,
+                           "SELECT id FROM j_users JOIN j_orders ON j_users.id = j_orders.user_id").unwrap_err();
+        assert!(err.contains("ambiguous"), "got: {}", err);
+
+        // ④ 裸 amount 只在 j_orders 里 → 唯一，正常放行
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT amount FROM j_users JOIN j_orders ON j_users.id = j_orders.user_id").unwrap();
+        match r {
+            ResultSet::Rows { columns, .. } => assert_eq!(columns, vec!["j_orders.amount"]),
+            other => panic!("expected Rows, got {:?}", other),
         }
 
         let _ = db.shutdown();

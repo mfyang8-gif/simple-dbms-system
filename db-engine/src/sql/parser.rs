@@ -71,20 +71,48 @@ impl Parser {
     // 先做最简单的版本（不含 WHERE / JOIN / GROUP BY），跑通基本流程
 
     fn parse_select(&mut self) -> Result<Statement, String> {
-        // expect(Select)
         self.expect(&Token::Select)?;
         let columns = self.parse_select_items()?;
         self.expect(&Token::From)?;
-        // table = expect_ident()
         let table = self.expect_ident()?;
-        // filter = None (先不做 WHERE)
+        // JOIN 子句（可选，支持 a JOIN b ON ... JOIN c ON ... 链式）
+        let joins = self.parse_joins()?;
+        // WHERE 在 JOIN 之后
         let filter = self.parse_where()?;
         // ORDER BY（可选，支持多列 + ASC/DESC）
         let order_by = self.parse_order_by()?;
-        // joins = vec![], group_by = vec![]
-        // Ok(Statement::Select { ... })
-        Ok(Statement::Select { columns, table, filter, joins: vec![], group_by: vec![], order_by })
+        Ok(Statement::Select { columns, table, filter, joins, group_by: vec![], order_by })
+    }
 
+    /// 解析 `JOIN <table> ON <a.col> = <b.col>`，支持连续多个 JOIN。
+    /// 当前只支持等值连接：任务书里的"多表连接"用等值已经够，
+    /// 非等值/多条件 AND 需要把 JoinClause 换成 Expr，属于后续扩展。
+    fn parse_joins(&mut self) -> Result<Vec<JoinClause>, String> {
+        let mut joins = Vec::new();
+        while self.peek() == &Token::Join {
+            self.advance(); // JOIN
+            let table = self.expect_ident()?;
+            self.expect(&Token::On)?;
+
+            // 左边 table.col
+            let lt = self.expect_ident()?;
+            self.expect(&Token::Dot)?;
+            let lc = self.expect_ident()?;
+
+            self.expect(&Token::Eq)?;
+
+            // 右边 table.col
+            let rt = self.expect_ident()?;
+            self.expect(&Token::Dot)?;
+            let rc = self.expect_ident()?;
+
+            joins.push(JoinClause {
+                table,
+                left_col: format!("{}.{}", lt, lc),
+                right_col: format!("{}.{}", rt, rc),
+            });
+        }
+        Ok(joins)
     }
 
     /// 解析 ORDER BY col [ASC|DESC] [, col ...]；没有则返回空 vec
@@ -97,7 +125,12 @@ impl Parser {
         self.expect(&Token::By)?;    // BY
 
         loop {
-            let column = self.expect_ident()?;
+            let mut column = self.expect_ident()?;
+            // 支持 ORDER BY users.id（JOIN 场景必须能写限定列）
+            if self.peek() == &Token::Dot {
+                self.advance();
+                column = format!("{}.{}", column, self.expect_ident()?);
+            }
             let asc = match self.peek() {
                 Token::Asc  => { self.advance(); true }
                 Token::Desc => { self.advance(); false }
@@ -258,9 +291,15 @@ impl Parser {
         }
         // 否则：逗号分隔的 Ident 列表 → [Column(name), ...]
         let mut columns = vec![];
-        while self.peek() != &Token::Eof {
-            columns.push(SelectItem::Column(self.expect_ident()?));
-            // 如果不是逗号，则结束
+        loop {
+            let first = self.expect_ident()?;
+            if self.peek() == &Token::Dot {
+                self.advance(); // eat '.'
+                let col = self.expect_ident()?;
+                columns.push(SelectItem::TableColumn { table: first, col });
+            } else {
+                columns.push(SelectItem::Column(first));
+            }
             if self.peek() != &Token::Comma { break; }
             self.advance();
         }
@@ -360,7 +399,16 @@ impl Parser {
     /// 解析"原子"表达式：列名、数字、字符串、NULL
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.advance() {
-            Token::Ident(name) => Ok(Expr::Column(name)),
+            // 限定列 table.col：往前多看一个 Dot 才能区分 Column 和 QualifiedColumn
+            Token::Ident(name) => {
+                if self.peek() == &Token::Dot {
+                    self.advance(); // eat '.'
+                    let col = self.expect_ident()?;
+                    Ok(Expr::QualifiedColumn { table: name, col })
+                } else {
+                    Ok(Expr::Column(name))
+                }
+            }
             Token::Number(n) => Ok(Expr::Literal(LitValue::Number(n))),
             Token::Str(s) => Ok(Expr::Literal(LitValue::Str(s))),
             Token::Null => Ok(Expr::Literal(LitValue::Null)),
@@ -637,5 +685,38 @@ mod tests {
             }
             other => panic!("expected Update, got {:?}", other),
         }
+    }
+    #[test]
+    fn test_qualified_column_in_select_and_where() {
+        let stmt = parse_sql("SELECT users.id, users.name FROM users WHERE users.id = 1").unwrap();
+        match stmt {
+            Statement::Select { columns, filter: Some(Expr::BinOp { left, op, .. }), .. } => {
+                assert_eq!(columns, vec![
+                    SelectItem::TableColumn { table: "users".into(), col: "id".into() },
+                    SelectItem::TableColumn { table: "users".into(), col: "name".into() },
+                ]);
+                assert_eq!(*left, Expr::QualifiedColumn { table: "users".into(), col: "id".into() });
+                assert_eq!(op, BinOp::Eq);
+            }
+            other => panic!("expected qualified columns, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_join_one_clause() {
+        let stmt = parse_sql(
+            "SELECT * FROM logs JOIN materials ON logs.material_code = materials.material_code").unwrap();
+        assert_eq!(stmt, Statement::Select {
+            columns: vec![SelectItem::Star],
+            table: "logs".into(),
+            filter: None,
+            joins: vec![JoinClause {
+                table: "materials".into(),
+                left_col: "logs.material_code".into(),
+                right_col: "materials.material_code".into(),
+            }],
+            group_by: vec![],
+            order_by: vec![],
+        });
     }
 }
