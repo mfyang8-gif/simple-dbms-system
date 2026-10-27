@@ -6,12 +6,11 @@ import com.dbms.client.dao.PersonnelDao;
 import com.dbms.client.entity.InventoryLog;
 import com.dbms.client.entity.Material;
 import com.dbms.client.entity.Personnel;
+import com.dbms.client.minidb.MiniDbConnection;
+import com.dbms.client.minidb.MiniDbResultSet;
+import com.dbms.client.minidb.MiniDbStatement;
 import com.dbms.client.util.DbUtil;
 
-import java.sql.Connection;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -22,8 +21,9 @@ import java.util.Map;
 /**
  * 进出仓业务逻辑 —— 课设核心考点：事务控制。
  *
- * 关键点：整个方法必须共用同一条 Connection，才能保证
+ * 关键点：整个方法必须共用同一条 MiniDbConnection，才能保证
  *        BEGIN / COMMIT / ROLLBACK 作用在同一批操作上。
+ *        MiniDB 是“一连接一会话”，与这里的事务写法天然契合。
  */
 public class InventoryService {
 
@@ -77,9 +77,9 @@ public class InventoryService {
         // 阶段②：真正的强事务
         int nextLogId = logDao.nextLogId();
         String today = LocalDate.now().toString();
-        Connection conn = null;
+        MiniDbConnection conn = null;
         try {
-            conn = DbUtil.getConnection();
+            conn = DbUtil.getMiniDbConnection();
             conn.setAutoCommit(false);      // 等价于发送 BEGIN
 
             for (Item it : items) {
@@ -111,7 +111,7 @@ public class InventoryService {
             if (conn != null) {
                 try {
                     conn.rollback();        // 等价于发送 ROLLBACK
-                } catch (SQLException ignored) {
+                } catch (Exception ignored) {
                 }
             }
             throw new RuntimeException("操作失败，已全部回滚：" + e.getMessage(), e);
@@ -162,18 +162,18 @@ public class InventoryService {
 
     // ---------- 事务内使用的小工具 ----------
 
-    private int queryStock(Connection conn, int code) throws SQLException {
-        try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT stock_qty FROM materials WHERE material_code = " + code)) {
+    private int queryStock(MiniDbConnection conn, int code) {
+        try (MiniDbStatement st = conn.createStatement();
+             MiniDbResultSet rs = st.executeQuery("SELECT stock_qty FROM materials WHERE material_code = " + code)) {
             if (!rs.next()) {
-                throw new SQLException("物料不存在：" + code);
+                throw new RuntimeException("物料不存在：" + code);
             }
             return rs.getInt(1);
         }
     }
 
-    private void exec(Connection conn, String sql) throws SQLException {
-        try (Statement st = conn.createStatement()) {
+    private void exec(MiniDbConnection conn, String sql) {
+        try (MiniDbStatement st = conn.createStatement()) {
             st.executeUpdate(sql);
         }
     }

@@ -1,13 +1,13 @@
 package com.dbms.client.dao;
 
 import com.dbms.client.entity.InventoryLog;
+import com.dbms.client.minidb.MiniDbConnection;
+import com.dbms.client.minidb.MiniDbException;
+import com.dbms.client.minidb.MiniDbResultSet;
+import com.dbms.client.minidb.MiniDbStatement;
 import com.dbms.client.util.DbUtil;
 import com.dbms.client.util.SqlUtil;
 
-import java.sql.Connection;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -17,13 +17,13 @@ public class InventoryLogDao {
     /** 把全部流水一次拉回内存，报表统计一律在内存里聚合（避开引擎的 SQL 限制）。 */
     public List<InventoryLog> listAll() {
         List<InventoryLog> list = new ArrayList<>();
-        try (Connection c = DbUtil.getConnection();
-             Statement st = c.createStatement();
-             ResultSet rs = st.executeQuery("SELECT * FROM inventory_logs ORDER BY log_id")) {
+        try (MiniDbConnection c = DbUtil.getMiniDbConnection();
+             MiniDbStatement st = c.createStatement();
+             MiniDbResultSet rs = st.executeQuery("SELECT * FROM inventory_logs ORDER BY log_id")) {
             while (rs.next()) {
                 list.add(map(rs));
             }
-        } catch (SQLException e) {
+        } catch (MiniDbException e) {
             throw new RuntimeException("查询进出仓记录失败：" + e.getMessage(), e);
         }
         return list;
@@ -41,20 +41,20 @@ public class InventoryLogDao {
         sql.append(" ORDER BY log_id");
 
         List<InventoryLog> list = new ArrayList<>();
-        try (Connection c = DbUtil.getConnection();
-             Statement st = c.createStatement();
-             ResultSet rs = st.executeQuery(sql.toString())) {
+        try (MiniDbConnection c = DbUtil.getMiniDbConnection();
+             MiniDbStatement st = c.createStatement();
+             MiniDbResultSet rs = st.executeQuery(sql.toString())) {
             while (rs.next()) {
                 list.add(map(rs));
             }
-        } catch (SQLException e) {
+        } catch (MiniDbException e) {
             throw new RuntimeException("查询进出仓记录失败：" + e.getMessage(), e);
         }
         return list;
     }
 
     /** 在已有连接上插入（事务中调用，不能自己开关连接）。 */
-    public static void insert(Connection conn, InventoryLog log) throws SQLException {
+    public static void insert(MiniDbConnection conn, InventoryLog log) {
         String sql = "INSERT INTO inventory_logs (log_id, material_code, op_type, qty, op_date, operator_id, remarks) VALUES ("
                 + log.getLogId() + ", "
                 + log.getMaterialCode() + ", "
@@ -63,34 +63,34 @@ public class InventoryLogDao {
                 + SqlUtil.lit(log.getOpDate()) + ", "
                 + log.getOperatorId() + ", "
                 + SqlUtil.lit(log.getRemarks()) + ")";
-        try (Statement st = conn.createStatement()) {
+        try (MiniDbStatement st = conn.createStatement()) {
             st.executeUpdate(sql);
-        }
-    }
-
-    public void insert(InventoryLog log) {
-        try (Connection c = DbUtil.getConnection()) {
-            insert(c, log);
-        } catch (SQLException e) {
+        } catch (MiniDbException e) {
             throw new RuntimeException("写入进出仓记录失败：" + e.getMessage(), e);
         }
     }
 
+    public void insert(InventoryLog log) {
+        try (MiniDbConnection c = DbUtil.getMiniDbConnection()) {
+            insert(c, log);
+        }
+    }
+
     public int nextLogId() {
-        try (Connection c = DbUtil.getConnection();
-             Statement st = c.createStatement();
-             ResultSet rs = st.executeQuery("SELECT MAX(log_id) FROM inventory_logs")) {
+        try (MiniDbConnection c = DbUtil.getMiniDbConnection();
+             MiniDbStatement st = c.createStatement();
+             MiniDbResultSet rs = st.executeQuery("SELECT MAX(log_id) FROM inventory_logs")) {
             int max = 0;
             if (rs.next()) {
                 max = rs.getInt(1);
             }
             return max + 1;
-        } catch (SQLException e) {
+        } catch (MiniDbException e) {
             throw new RuntimeException("生成流水单号失败：" + e.getMessage(), e);
         }
     }
 
-    private InventoryLog map(ResultSet rs) throws SQLException {
+    private InventoryLog map(MiniDbResultSet rs) {
         InventoryLog log = new InventoryLog();
         log.setLogId(rs.getInt("log_id"));
         log.setMaterialCode(rs.getInt("material_code"));

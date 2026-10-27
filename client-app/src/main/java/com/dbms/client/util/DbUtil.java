@@ -1,20 +1,24 @@
 package com.dbms.client.util;
 
+import com.dbms.client.minidb.MiniDbConnection;
+
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.SQLException;
 import java.util.Properties;
 
 /**
  * 数据库连接工具。
- * 连接信息全部来自 config/db.properties，切换 MySQL / Rust 引擎只改配置文件，不动代码。
+ *
+ * MiniDB（Rust 引擎）是自定义 TCP 文本协议，不走 JDBC；
+ * 连接信息来自 config/db.properties 的 db.host / db.port。
+ * 切换 MySQL / Rust 引擎只改配置文件，不动业务代码。
  */
 public final class DbUtil {
 
     private static final Properties CFG = new Properties();
+    private static String HOST = "127.0.0.1";
+    private static int PORT = 9000;
 
     static {
         try {
@@ -37,8 +41,8 @@ public final class DbUtil {
                     CFG.load(in);
                 }
             }
-            String driver = CFG.getProperty("db.driver", "com.mysql.cj.jdbc.Driver");
-            Class.forName(driver);
+            HOST = CFG.getProperty("db.host", HOST);
+            PORT = Integer.parseInt(CFG.getProperty("db.port", "9000"));
         } catch (Exception e) {
             throw new IllegalStateException("加载数据库配置失败，请检查 config/db.properties：" + e.getMessage(), e);
         }
@@ -47,15 +51,12 @@ public final class DbUtil {
     private DbUtil() {
     }
 
-    public static Connection getConnection() throws SQLException {
-        return DriverManager.getConnection(
-                CFG.getProperty("db.url"),
-                CFG.getProperty("db.user"),
-                CFG.getProperty("db.password"));
+    public static MiniDbConnection getMiniDbConnection() {
+        return new MiniDbConnection(HOST, PORT);
     }
 
     public static String currentUrl() {
-        return CFG.getProperty("db.url");
+        return "minidb://" + HOST + ":" + PORT;
     }
 
     public static void closeQuietly(AutoCloseable... resources) {

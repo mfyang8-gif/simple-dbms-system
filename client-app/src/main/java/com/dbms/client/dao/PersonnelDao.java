@@ -1,13 +1,13 @@
 package com.dbms.client.dao;
 
 import com.dbms.client.entity.Personnel;
+import com.dbms.client.minidb.MiniDbConnection;
+import com.dbms.client.minidb.MiniDbException;
+import com.dbms.client.minidb.MiniDbResultSet;
+import com.dbms.client.minidb.MiniDbStatement;
 import com.dbms.client.util.DbUtil;
 import com.dbms.client.util.SqlUtil;
 
-import java.sql.Connection;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -26,13 +26,13 @@ public class PersonnelDao {
         sql.append(" ORDER BY id");
 
         List<Personnel> list = new ArrayList<>();
-        try (Connection c = DbUtil.getConnection();
-             Statement st = c.createStatement();
-             ResultSet rs = st.executeQuery(sql.toString())) {
+        try (MiniDbConnection c = DbUtil.getMiniDbConnection();
+             MiniDbStatement st = c.createStatement();
+             MiniDbResultSet rs = st.executeQuery(sql.toString())) {
             while (rs.next()) {
                 list.add(map(rs));
             }
-        } catch (SQLException e) {
+        } catch (MiniDbException e) {
             throw new RuntimeException("查询人员档案失败：" + e.getMessage(), e);
         }
         return list;
@@ -40,11 +40,11 @@ public class PersonnelDao {
 
     public Personnel findById(int id) {
         String sql = "SELECT * FROM personnel WHERE id = " + id;
-        try (Connection c = DbUtil.getConnection();
-             Statement st = c.createStatement();
-             ResultSet rs = st.executeQuery(sql)) {
+        try (MiniDbConnection c = DbUtil.getMiniDbConnection();
+             MiniDbStatement st = c.createStatement();
+             MiniDbResultSet rs = st.executeQuery(sql)) {
             return rs.next() ? map(rs) : null;
-        } catch (SQLException e) {
+        } catch (MiniDbException e) {
             throw new RuntimeException("查询人员失败：" + e.getMessage(), e);
         }
     }
@@ -93,29 +93,29 @@ public class PersonnelDao {
 
     public int nextId() {
         String sql = "SELECT MAX(id) FROM personnel";
-        try (Connection c = DbUtil.getConnection();
-             Statement st = c.createStatement();
-             ResultSet rs = st.executeQuery(sql)) {
+        try (MiniDbConnection c = DbUtil.getMiniDbConnection();
+             MiniDbStatement st = c.createStatement();
+             MiniDbResultSet rs = st.executeQuery(sql)) {
             int max = 1000;
             if (rs.next()) {
                 max = Math.max(max, rs.getInt(1));
             }
             return max + 1;
-        } catch (SQLException e) {
+        } catch (MiniDbException e) {
             throw new RuntimeException("生成人员代码失败：" + e.getMessage(), e);
         }
     }
 
     private void update(String sql, String errorMsg) {
-        try (Connection c = DbUtil.getConnection();
-             Statement st = c.createStatement()) {
+        try (MiniDbConnection c = DbUtil.getMiniDbConnection();
+             MiniDbStatement st = c.createStatement()) {
             st.executeUpdate(sql);
-        } catch (SQLException e) {
+        } catch (MiniDbException e) {
             throw new RuntimeException(errorMsg + "：" + e.getMessage(), e);
         }
     }
 
-    private Personnel map(ResultSet rs) throws SQLException {
+    private Personnel map(MiniDbResultSet rs) {
         Personnel p = new Personnel();
         p.setId(rs.getInt("id"));
         p.setName(rs.getString("name"));
