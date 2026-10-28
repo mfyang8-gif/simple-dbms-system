@@ -128,6 +128,13 @@ impl Lexer {
                     "DEFAULT" => Ok(Token::Default),
                     "AS" => Ok(Token::As),
                     "DISTINCT" => Ok(Token::Distinct),
+                    // 聚合函数名也收进关键字表：
+                    // 否则 "SUM" 会先被 lexer 当成 Ident，parser 得回头做字符串比较
+                    "SUM" => Ok(Token::Sum),
+                    "COUNT" => Ok(Token::Count),
+                    "AVG" => Ok(Token::Avg),
+                    "MIN" => Ok(Token::Min),
+                    "MAX" => Ok(Token::Max),
                     _ => Ok(Token::Ident(s)),
                 }
 
@@ -284,6 +291,16 @@ mod tests {
                 Token::And,
                 Token::Ident("c".into()), Token::Le, Token::Number(3),
                 Token::Eof
+            ]
+        );
+    }
+    #[test]
+    fn test_agg_function_keywords() {
+        assert_eq!(
+            tokens("count(*) group by"),
+            vec![
+                Token::Count, Token::LParen, Token::Star, Token::RParen,
+                Token::Group, Token::By, Token::Eof
             ]
         );
     }

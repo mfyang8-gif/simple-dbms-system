@@ -78,10 +78,13 @@ impl Parser {
         // JOIN 子句（可选，支持 a JOIN b ON ... JOIN c ON ... 链式）
         let joins = self.parse_joins()?;
         // WHERE 在 JOIN 之后
+        // WHERE 在 JOIN 之后
         let filter = self.parse_where()?;
+        // GROUP BY 在 WHERE 之后、ORDER BY 之前（这是 SQL 的固定子句顺序）
+        let group_by = self.parse_group_by()?;
         // ORDER BY（可选，支持多列 + ASC/DESC）
         let order_by = self.parse_order_by()?;
-        Ok(Statement::Select { columns, table, filter, joins, group_by: vec![], order_by })
+        Ok(Statement::Select { columns, table, filter, joins, group_by, order_by })
     }
 
     /// 解析 `JOIN <table> ON <a.col> = <b.col>`，支持连续多个 JOIN。
@@ -114,7 +117,31 @@ impl Parser {
         }
         Ok(joins)
     }
+    /// 解析 `GROUP BY col [, col ...]`；没有则返回空 vec。
+    /// 支持 `GROUP BY users.dept` 这种限定列（JOIN 之后按某张表的列分组要用）。
+    /// 不支持 HAVING —— 写了 HAVING 会停在那里，被 parse() 末尾的 Eof 校验报
+    /// "expected end of statement, got Ident(\"HAVING\")"。
+    fn parse_group_by(&mut self) -> Result<Vec<String>, String> {
+        let mut cols = Vec::new();
+        if self.peek() != &Token::Group {
+            return Ok(cols);
+        }
+        self.advance();              // GROUP
+        self.expect(&Token::By)?;    // BY
 
+        loop {
+            let mut col = self.expect_ident()?;
+            if self.peek() == &Token::Dot {
+                self.advance();
+                col = format!("{}.{}", col, self.expect_ident()?);
+            }
+            cols.push(col);
+
+            if self.peek() != &Token::Comma { break; }
+            self.advance();
+        }
+        Ok(cols)
+    }
     /// 解析 ORDER BY col [ASC|DESC] [, col ...]；没有则返回空 vec
     fn parse_order_by(&mut self) -> Result<Vec<OrderByItem>, String> {
         let mut items = Vec::new();
@@ -289,22 +316,60 @@ impl Parser {
             self.advance();
             return Ok(vec![SelectItem::Star]);
         }
-        // 否则：逗号分隔的 Ident 列表 → [Column(name), ...]
+
         let mut columns = vec![];
         loop {
-            let first = self.expect_ident()?;
-            if self.peek() == &Token::Dot {
-                self.advance(); // eat '.'
-                let col = self.expect_ident()?;
-                columns.push(SelectItem::TableColumn { table: first, col });
+            // ① 先判断这一项是不是聚合函数（关键字已在 lexer 里映射好）
+            let func = match self.peek() {
+                Token::Sum   => Some(AggFunc::Sum),
+                Token::Count => Some(AggFunc::Count),
+                Token::Avg   => Some(AggFunc::Avg),
+                Token::Min   => Some(AggFunc::Min),
+                Token::Max   => Some(AggFunc::Max),
+                _ => None,
+            };
+
+            if let Some(func) = func {
+                self.advance();                  // 吃掉函数名
+                self.expect(&Token::LParen)?;
+
+                // COUNT(*) 是特例：数"行数"，不针对某一列。
+                // SelectItem::Aggregate 的 column 是 String（不是 Option），
+                // 这里用 "*" 当哨兵，Step 2 的 executor 看到 "*" 就数行、看到列名就数非 NULL。
+                let column = if self.peek() == &Token::Star {
+                    if func != AggFunc::Count {
+                        return Err(format!("{:?}(*) is not allowed, only COUNT(*)", func));
+                    }
+                    self.advance();
+                    "*".to_string()
+                } else {
+                    // 允许 SUM(orders.amount) 这种限定列
+                    let mut name = self.expect_ident()?;
+                    if self.peek() == &Token::Dot {
+                        self.advance();
+                        name = format!("{}.{}", name, self.expect_ident()?);
+                    }
+                    name
+                };
+
+                self.expect(&Token::RParen)?;
+                columns.push(SelectItem::Aggregate { func, column });
             } else {
-                columns.push(SelectItem::Column(first));
+                // ② 普通列：name 或 table.name（与原来一致）
+                let first = self.expect_ident()?;
+                if self.peek() == &Token::Dot {
+                    self.advance(); // eat '.'
+                    let col = self.expect_ident()?;
+                    columns.push(SelectItem::TableColumn { table: first, col });
+                } else {
+                    columns.push(SelectItem::Column(first));
+                }
             }
+
             if self.peek() != &Token::Comma { break; }
             self.advance();
         }
         Ok(columns)
-
     }
 
     // ===== WHERE 表达式解析（递归 + 优先级） =====
@@ -718,5 +783,29 @@ mod tests {
             group_by: vec![],
             order_by: vec![],
         });
+    }
+    #[test]
+    fn test_aggregate_and_group_by() {
+        let s = parse_sql(
+            "SELECT dept, COUNT(*), SUM(amount), AVG(price) FROM sales GROUP BY dept").unwrap();
+        match s {
+            Statement::Select { columns, group_by, .. } => {
+                assert_eq!(group_by, vec!["dept".to_string()]);
+                assert_eq!(columns, vec![
+                    SelectItem::Column("dept".into()),
+                    SelectItem::Aggregate { func: AggFunc::Count, column: "*".into() },
+                    SelectItem::Aggregate { func: AggFunc::Sum, column: "amount".into() },
+                    SelectItem::Aggregate { func: AggFunc::Avg, column: "price".into() },
+                ]);
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_agg_star_only_for_count() {
+        // SUM(*) 是非法语法，错误信息要能让人看懂
+        let err = parse_sql("SELECT SUM(*) FROM t").unwrap_err();
+        assert!(err.contains("COUNT(*)"), "got: {}", err);
     }
 }

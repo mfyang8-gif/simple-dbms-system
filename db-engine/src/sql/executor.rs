@@ -9,7 +9,7 @@ use crate::record::Record;
 use crate::row::Row;
 use crate::table::Table;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[derive(Debug)]
 pub enum ResultSet {
     /// None = SQL NULL（不能用空字符串代替，否则会把 NULL 当成 "" 输出）
@@ -154,8 +154,8 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
         }
         Statement::DropTable { name } => execute_drop_table(name, db),
         Statement::Insert { table, columns, values } => execute_insert(table, columns, values, db, session),
-        Statement::Select { columns, table, joins,filter, order_by, .. }=> {
-            execute_select(columns, table, joins, filter, order_by, db)
+        Statement::Select { columns, table, joins, filter, group_by, order_by, .. } => {
+            execute_select(columns, table, joins, filter, group_by, order_by, db)
         },
         Statement::Delete { table, filter } => execute_delete(table, filter, db, session),
         Statement::Begin => {
@@ -462,11 +462,209 @@ fn join_dfs(
     }
     Ok(())
 }
+
+/// 聚合累加器：边遍历组内行边算，不把整组值留在内存里。
+#[derive(Default)]
+struct AggState {
+    /// 非 NULL 的个数：COUNT(col) 只数它；SUM/AVG 判断"空集"也靠它
+    non_null: usize,
+    sum: i64,
+    /// 出现过字符串：SUM/AVG 遇到 VARCHAR 要报错，而不是把字节当数字
+    has_str: bool,
+    min: Option<Value>,
+    max: Option<Value>,
+}
+
+impl AggState {
+    fn update(&mut self, v: &Value) {
+        // NULL 不参与任何聚合（COUNT(*) 用的是行数，不经过这里）
+        if matches!(v, Value::Null) {
+            return;
+        }
+        self.non_null += 1;
+        match v {
+            Value::Int(n) => self.sum += *n,
+            Value::Str(_) => self.has_str = true,
+            Value::Null => {}   // 上面已 return，这里只为让 match 穷尽
+        }
+        if self.min.as_ref().map_or(true, |m| cmp_for_sort(v, m) == Ordering::Less) {
+            self.min = Some(v.clone());
+        }
+        if self.max.as_ref().map_or(true, |m| cmp_for_sort(v, m) == Ordering::Greater) {
+            self.max = Some(v.clone());
+        }
+    }
+
+    fn finish(&self, func: &AggFunc) -> Result<Value, String> {
+        match func {
+            // COUNT(col)：只数非 NULL
+            AggFunc::Count => Ok(Value::Int(self.non_null as i64)),
+            AggFunc::Min => Ok(self.min.clone().unwrap_or(Value::Null)),
+            AggFunc::Max => Ok(self.max.clone().unwrap_or(Value::Null)),
+            AggFunc::Sum | AggFunc::Avg => {
+                // ★ 空集（含全 NULL）返回 NULL，不是 0
+                if self.non_null == 0 {
+                    return Ok(Value::Null);
+                }
+                if self.has_str {
+                    return Err(format!("{:?} requires an INT column", func));
+                }
+                if matches!(func, AggFunc::Avg) {
+                    // 只有 INT，没有小数：整数除法，向零截断（教学取舍，写进边界表）
+                    Ok(Value::Int(self.sum / self.non_null as i64))
+                } else {
+                    Ok(Value::Int(self.sum))
+                }
+            }
+        }
+    }
+}
+
+/// 输出列名：SUM(amount) / COUNT(*) 这种"函数式"名字
+fn agg_name(func: &AggFunc, column: &str) -> String {
+    let f = match func {
+        AggFunc::Sum => "SUM",
+        AggFunc::Count => "COUNT",
+        AggFunc::Avg => "AVG",
+        AggFunc::Min => "MIN",
+        AggFunc::Max => "MAX",
+    };
+    format!("{}({})", f, column)
+}
+
+/// 分组 + 聚合：输入"WHERE 过滤后的完整行"，输出"每个组一行的结果"。
+///
+/// 三种情形共用这一条路：
+///   - 有聚合 + 有 GROUP BY：按 key 分组，每组一行
+///   - 有聚合 + 无 GROUP BY：全表一个组（空表也要产出一个空组）
+///   - 无聚合 + 有 GROUP BY：就是 DISTINCT 的效果（每组取一行）
+fn aggregate_rows(
+    columns: &[SelectItem],
+    group_by: &[String],
+    col_names: &[String],
+    multi: bool,
+    decoded: Vec<Vec<Value>>,
+) -> Result<(Vec<String>, Vec<Vec<Value>>), String> {
+    // ① 分组列 → 下标
+    let group_idx: Vec<usize> = group_by
+        .iter()
+        .map(|c| resolve_column(c, col_names))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // ② 先把 SELECT 列表校验完，再动数据：避免算到一半才发现语义错
+    for item in columns {
+        match item {
+            SelectItem::Star => {
+                return Err("SELECT * cannot be combined with GROUP BY or aggregate functions".into());
+            }
+            SelectItem::Column(name) => {
+                let i = resolve_column(name, col_names)?;
+                if !group_idx.contains(&i) {
+                    return Err(format!(
+                        "column '{}' must appear in GROUP BY or be used in an aggregate", name));
+                }
+            }
+            SelectItem::TableColumn { table, col } => {
+                let full = format!("{}.{}", table, col);
+                let i = resolve_column(&full, col_names)?;
+                if !group_idx.contains(&i) {
+                    return Err(format!(
+                        "column '{}' must appear in GROUP BY or be used in an aggregate", full));
+                }
+            }
+            SelectItem::Aggregate { column, .. } => {
+                // "*" 是 COUNT(*) 的哨兵，不需要解析；其它列名早点报 not found
+                if column != "*" {
+                    resolve_column(column, col_names)?;
+                }
+            }
+        }
+    }
+
+    // ③ 建组：key 用 Option<String>，NULL 会聚成同一组（SQL 语义），
+    //    又不会跟字符串 "NULL" 撞车。Vec 保"首次出现顺序"，HashMap 只负责定位。
+    let mut groups: Vec<Vec<Vec<Value>>> = Vec::new();
+    let mut index: HashMap<Vec<Option<String>>, usize> = HashMap::new();
+    for row in decoded {
+        let key: Vec<Option<String>> = group_idx.iter().map(|&i| row[i].to_cell()).collect();
+        match index.get(&key) {
+            Some(&g) => groups[g].push(row),
+            None => {
+                index.insert(key, groups.len());
+                groups.push(vec![row]);
+            }
+        }
+    }
+
+    // ④ 没有 GROUP BY 的聚合是"全表一个组"：即使一行都没有，也要补一个空组，
+    //    否则 COUNT(*) 会返回 0 行，而不是 1 行 0。
+    if group_idx.is_empty() && groups.is_empty() {
+        groups.push(Vec::new());
+    }
+
+    // ⑤ 输出列名只算一次（与组数无关；放进逐组循环会重复 push）
+    let mut out_names: Vec<String> = Vec::with_capacity(columns.len());
+    for item in columns {
+        out_names.push(match item {
+            SelectItem::Star => unreachable!("已在 ② 拦掉"),
+            SelectItem::Column(name) => {
+                let i = resolve_column(name, col_names)?;
+                if multi { col_names[i].clone() } else { short_name(&col_names[i]).to_string() }
+            }
+            SelectItem::TableColumn { table, col } => {
+                let full = format!("{}.{}", table, col);
+                let i = resolve_column(&full, col_names)?;
+                if multi { col_names[i].clone() } else { col.to_string() }
+            }
+            SelectItem::Aggregate { func, column } => agg_name(func, column),
+        });
+    }
+
+    // ⑥ 逐组算值
+    let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+    for rows in &groups {
+        let mut vals: Vec<Value> = Vec::with_capacity(columns.len());
+        for item in columns {
+            match item {
+                SelectItem::Star => unreachable!("已在 ② 拦掉"),
+                // 分组列：同组内取值相同，取第一行即可
+                SelectItem::Column(name) => {
+                    let i = resolve_column(name, col_names)?;
+                    let first = rows.first().ok_or("internal: plain column in an empty group")?;
+                    vals.push(first[i].clone());
+                }
+                SelectItem::TableColumn { table, col } => {
+                    let full = format!("{}.{}", table, col);
+                    let i = resolve_column(&full, col_names)?;
+                    let first = rows.first().ok_or("internal: plain column in an empty group")?;
+                    vals.push(first[i].clone());
+                }
+                SelectItem::Aggregate { func, column } => {
+                    if column == "*" {
+                        // 只有 COUNT(*) 能走到这里（parser 已保证）
+                        vals.push(Value::Int(rows.len() as i64));
+                    } else {
+                        let i = resolve_column(column, col_names)?;
+                        let mut st = AggState::default();
+                        for r in rows {
+                            st.update(&r[i]);
+                        }
+                        vals.push(st.finish(func)?);
+                    }
+                }
+            }
+        }
+        out_rows.push(vals);
+    }
+
+    Ok((out_names, out_rows))
+}
 fn execute_select(
     columns: Vec<SelectItem>,
     table_name: String,
     joins: Vec<JoinClause>,
     filter: Option<Expr>,
+    group_by: Vec<String>,
     order_by: Vec<OrderByItem>,
     db: &mut Database,
 ) -> Result<ResultSet, String> {
@@ -524,6 +722,45 @@ fn execute_select(
         }
         decoded = kept;
     }
+
+
+    // ⑥ 聚合分支：只要出现聚合函数、或写了 GROUP BY，就走"先分组、再算值"
+    //    位置很关键：在 WHERE 之后（先筛行），在投影/ORDER BY 之前（后面排序的是聚合结果）
+    let has_agg = columns.iter().any(|c| matches!(c, SelectItem::Aggregate { .. }));
+    if has_agg || !group_by.is_empty() {
+        let (out_names, mut out_rows) =
+            aggregate_rows(&columns, &group_by, &col_names, multi, decoded)?;
+
+        // 聚合之后 "amount" 这种原始列已经不在结果里了，ORDER BY 只能引用输出列
+        let mut sort_keys: Vec<(usize, bool)> = Vec::new();
+        for item in &order_by {
+            let idx = resolve_column(&item.column, &out_names).map_err(|_| {
+                format!("ORDER BY '{}' must be a column in the select list when aggregating",
+                        item.column)
+            })?;
+            sort_keys.push((idx, item.asc));
+        }
+        if !sort_keys.is_empty() {
+            out_rows.sort_by(|a, b| {
+                for &(idx, asc) in &sort_keys {
+                    let ord = cmp_for_sort(&a[idx], &b[idx]);
+                    if ord != Ordering::Equal {
+                        return if asc { ord } else { ord.reverse() };
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+
+        let rows: Vec<Vec<Option<String>>> = out_rows
+            .iter()
+            .map(|vals| vals.iter().map(|v| v.to_cell()).collect())
+            .collect();
+        return Ok(ResultSet::Rows { columns: out_names, rows });
+    }
+    // ↓ 以下原来的 ⑥⑦⑧ 顺延成 ⑦⑧⑨（只是注释编号）
+
+
 
     // ⑥ 投影：Star → 全列；Column → 短名解析；TableColumn → 限定名解析
     let proj: Vec<usize> = match &columns[..] {
@@ -1532,6 +1769,69 @@ mod tests {
         // ⑥ 错误前缀不能被短名兜住（否则 other.name 会误命中 name）
         let err = exec_sql(&mut db, &mut session, "SELECT nope.name FROM j_users").unwrap_err();
         assert!(err.contains("not found"), "got: {}", err);
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_group_by_and_aggregates() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE g_sales (id INT PRIMARY KEY, dept VARCHAR(10), amount INT, note VARCHAR(10))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO g_sales VALUES (1, 'A', 100, 'x')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO g_sales VALUES (2, 'A', 200, NULL)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO g_sales VALUES (3, 'B', 50, NULL)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO g_sales VALUES (4, 'B', 70, 'y')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO g_sales VALUES (5, NULL, 30, 'z')").unwrap();
+
+        // ① 分组 + 五个函数；COUNT(note) 必须跳过 NULL
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT dept, COUNT(*), COUNT(note), SUM(amount), AVG(amount), MIN(amount), MAX(amount) \
+             FROM g_sales GROUP BY dept ORDER BY dept").unwrap();
+        match r {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec![
+                    "dept".to_string(), "COUNT(*)".to_string(), "COUNT(note)".to_string(),
+                    "SUM(amount)".to_string(), "AVG(amount)".to_string(),
+                    "MIN(amount)".to_string(), "MAX(amount)".to_string(),
+                ]);
+                // ORDER BY dept ASC：NULL 组排最前（cmp_for_sort 的约定）
+                assert_eq!(cells(&rows[0]), vec!["NULL", "1", "1", "30", "30", "30", "30"]);
+                assert_eq!(cells(&rows[1]), vec!["A", "2", "1", "300", "150", "100", "200"]);
+                assert_eq!(cells(&rows[2]), vec!["B", "2", "1", "120", "60", "50", "70"]);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // ② 没有 GROUP BY：空输入也必须交出一行（COUNT=0，SUM=NULL）
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT COUNT(*), SUM(amount) FROM g_sales WHERE id > 999").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(cells(&rows[0]), vec!["0", "NULL"]);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // ③ 非分组列 → 必须报错，不能静默取第一行
+        let err = exec_sql(&mut db, &mut session,
+                           "SELECT id, COUNT(*) FROM g_sales GROUP BY dept").unwrap_err();
+        assert!(err.contains("GROUP BY"), "got: {}", err);
+
+        // ④ SELECT * 与 GROUP BY 混用 → 报错
+        let err = exec_sql(&mut db, &mut session,
+                           "SELECT * FROM g_sales GROUP BY dept").unwrap_err();
+        assert!(err.contains("SELECT *"), "got: {}", err);
+
+        // ⑤ 无聚合、只有 GROUP BY → 等价去重
+        let r = exec_sql(&mut db, &mut session, "SELECT dept FROM g_sales GROUP BY dept").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 3, "A/B/NULL 三组"),
+            other => panic!("expected Rows, got {:?}", other),
+        }
 
         let _ = db.shutdown();
     }
