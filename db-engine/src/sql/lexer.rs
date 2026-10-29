@@ -116,6 +116,8 @@ impl Lexer {
                     "ORDER" => Ok(Token::Order),
                     "ASC" => Ok(Token::Asc),
                     "DESC" => Ok(Token::Desc),
+                   
+                    "LIMIT" => Ok(Token::Limit),
                     "BEGIN" => Ok(Token::Begin),
                     "COMMIT" => Ok(Token::Commit),
                     "ROLLBACK" => Ok(Token::Rollback),

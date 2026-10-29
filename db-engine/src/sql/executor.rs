@@ -154,8 +154,8 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
         }
         Statement::DropTable { name } => execute_drop_table(name, db),
         Statement::Insert { table, columns, values } => execute_insert(table, columns, values, db, session),
-        Statement::Select { columns, table, joins, filter, group_by, order_by, .. } => {
-            execute_select(columns, table, joins, filter, group_by, order_by, db)
+        Statement::Select { columns, table, joins, filter, group_by, order_by, limit, .. } => {
+            execute_select(columns, table, joins, filter, group_by, order_by, limit, db)
         },
         Statement::Delete { table, filter } => execute_delete(table, filter, db, session),
         Statement::Begin => {
@@ -666,6 +666,7 @@ fn execute_select(
     filter: Option<Expr>,
     group_by: Vec<String>,
     order_by: Vec<OrderByItem>,
+    limit: Option<usize>,
     db: &mut Database,
 ) -> Result<ResultSet, String> {
     let multi = !joins.is_empty();
@@ -751,6 +752,9 @@ fn execute_select(
                 Ordering::Equal
             });
         }
+        if let Some(limit) = limit {
+            out_rows = out_rows.into_iter().take(limit).collect();
+        }
 
         let rows: Vec<Vec<Option<String>>> = out_rows
             .iter()
@@ -797,6 +801,10 @@ fn execute_select(
             Ordering::Equal
         });
     }
+    if let Some(limit) = limit {
+        decoded = decoded.into_iter().take(limit).collect();
+    }
+
 
     // ⑧ 投影落地 + 输出列名（多表时就是 "表名.列名"）
     let rows: Vec<Vec<Option<String>>> = decoded
@@ -1831,6 +1839,50 @@ mod tests {
         match r {
             ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 3, "A/B/NULL 三组"),
             other => panic!("expected Rows, got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_limit() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE l_num (id INT PRIMARY KEY)").unwrap();
+        for i in 1..=5 {
+            exec_sql(&mut db, &mut session, &format!("INSERT INTO l_num VALUES ({})", i)).unwrap();
+        }
+
+        // ① ORDER BY + LIMIT：截的必须是"排序后的前 2 行"
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT id FROM l_num ORDER BY id DESC LIMIT 2").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(cells_all(&rows), vec![
+                    vec!["5".to_string()], vec!["4".to_string()],
+                ], "先截断再排序会得到 1,2 —— 这就是错位");
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // ② LIMIT 0：0 行，但列名要保留
+        let r = exec_sql(&mut db, &mut session, "SELECT id FROM l_num LIMIT 0").unwrap();
+        match r {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["id"]);
+                assert_eq!(rows.len(), 0);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // ③ 聚合分支也必须截断（只改普通路径的话，这条会挂）
+        let r = exec_sql(&mut db, &mut session, "SELECT COUNT(*) FROM l_num LIMIT 0").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0, "聚合路径的 LIMIT 0 没生效");
+            }
+            other => panic!("got {:?}", other),
         }
 
         let _ = db.shutdown();

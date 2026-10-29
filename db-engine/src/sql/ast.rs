@@ -26,6 +26,9 @@ pub enum Statement {
         filter: Option<Expr>,
         group_by: Vec<String>,
         order_by: Vec<OrderByItem>,
+        /// LIMIT n；None = 不限。用 Option 而不是 0 表示"不限"，
+        /// 因为 LIMIT 0 是合法语句，含义是"返回 0 行"，两者不能混。
+        limit: Option<usize>,
     },
     /// UPDATE users SET name = 'Bob' WHERE id = 1
     Update {

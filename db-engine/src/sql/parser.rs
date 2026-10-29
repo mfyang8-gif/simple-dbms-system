@@ -60,6 +60,7 @@ impl Parser {
         }
     }
 
+    /// 解析一个标识符（表名、列名）
     fn expect_ident(&mut self) -> Result<String, String> {
         match self.advance() {
             Token::Ident(s) => Ok(s),
@@ -83,8 +84,11 @@ impl Parser {
         // GROUP BY 在 WHERE 之后、ORDER BY 之前（这是 SQL 的固定子句顺序）
         let group_by = self.parse_group_by()?;
         // ORDER BY（可选，支持多列 + ASC/DESC）
+        // ORDER BY（可选，支持多列 + ASC/DESC）
         let order_by = self.parse_order_by()?;
-        Ok(Statement::Select { columns, table, filter, joins, group_by, order_by })
+        // LIMIT 是整条 SELECT 的最后一个子句，必须在 ORDER BY 之后解析
+        let limit = self.parse_limit()?;
+        Ok(Statement::Select { columns, table, filter, joins, group_by, order_by, limit })
     }
 
     /// 解析 `JOIN <table> ON <a.col> = <b.col>`，支持连续多个 JOIN。
@@ -170,7 +174,19 @@ impl Parser {
         }
         Ok(items)
     }
-
+    /// 解析 `LIMIT n`；没有则返回 None。
+    /// n 只接受非负整数字面量：lexer 没有 '-' 分支，`LIMIT -1` 在词法阶段就报错，
+    /// 走到这里只可能是写了个别的东西（比如 LIMIT 'x'）。
+    fn parse_limit(&mut self) -> Result<Option<usize>, String> {
+        if self.peek() != &Token::Limit {
+            return Ok(None);
+        }
+        self.advance(); // LIMIT
+        match self.advance() {
+            Token::Number(n) if n >= 0 => Ok(Some(n as usize)),
+            tok => Err(format!("expected non-negative integer after LIMIT, got {:?}", tok)),
+        }
+    }
     /// UPDATE <table> SET col = value [, col = value ...] [WHERE ...]
     fn parse_update(&mut self) -> Result<Statement, String> {
         self.expect(&Token::Update)?;
@@ -523,6 +539,7 @@ mod tests {
             joins: vec![],
             group_by: vec![],
             order_by: vec![],
+            limit: None,
         });
     }
 
@@ -539,6 +556,7 @@ mod tests {
             joins: vec![],
             group_by: vec![],
             order_by: vec![],
+            limit: None,
         });
     }
 
@@ -558,6 +576,7 @@ mod tests {
             joins: vec![],
             group_by: vec![],
             order_by: vec![],
+            limit: None,
         });
     }
 
@@ -782,6 +801,7 @@ mod tests {
             }],
             group_by: vec![],
             order_by: vec![],
+            limit: None,
         });
     }
     #[test]
@@ -807,5 +827,19 @@ mod tests {
         // SUM(*) 是非法语法，错误信息要能让人看懂
         let err = parse_sql("SELECT SUM(*) FROM t").unwrap_err();
         assert!(err.contains("COUNT(*)"), "got: {}", err);
+    }
+    #[test]
+    fn test_limit() {
+        let s = parse_sql("SELECT * FROM t LIMIT 3").unwrap();
+        match s {
+            Statement::Select { limit, .. } => assert_eq!(limit, Some(3)),
+            other => panic!("got {:?}", other),
+        }
+        // LIMIT 0 是合法语句，必须解析成 Some(0)，不能变成 None
+        let s = parse_sql("SELECT * FROM t LIMIT 0").unwrap();
+        match s {
+            Statement::Select { limit, .. } => assert_eq!(limit, Some(0)),
+            other => panic!("got {:?}", other),
+        }
     }
 }
