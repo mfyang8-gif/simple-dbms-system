@@ -80,16 +80,18 @@ impl Parser {
         let joins = self.parse_joins()?;
         // WHERE 在 JOIN 之后
         // WHERE 在 JOIN 之后
+        // WHERE 在 JOIN 之后
         let filter = self.parse_where()?;
-        // GROUP BY 在 WHERE 之后、ORDER BY 之前（这是 SQL 的固定子句顺序）
+        // GROUP BY 在 WHERE 之后、HAVING 之前
         let group_by = self.parse_group_by()?;
-        // ORDER BY（可选，支持多列 + ASC/DESC）
+        // HAVING 在 GROUP BY 之后、ORDER BY 之前（标准子句顺序）
+        let having = self.parse_having()?;
         // ORDER BY（可选，支持多列 + ASC/DESC）
         let order_by = self.parse_order_by()?;
         // LIMIT 是整条 SELECT 的最后一个子句，必须在 ORDER BY 之后解析
         let limit = self.parse_limit()?;
-        Ok(Statement::Select { columns, table, filter, joins, group_by, order_by, limit })
-    }
+        Ok(Statement::Select { columns, table, filter, joins, group_by, having, order_by, limit })
+            }
 
     /// 解析 `JOIN <table> ON <a.col> = <b.col>`，支持连续多个 JOIN。
     /// 当前只支持等值连接：任务书里的"多表连接"用等值已经够，
@@ -174,6 +176,22 @@ impl Parser {
         }
         Ok(items)
     }
+
+
+    /// 解析 `HAVING <expr>`；没有则返回 None。
+    ///
+    /// 条件表达式复用 WHERE 那一整套（OR/AND/NOT/比较/IS NULL/LIKE），
+    /// 唯一的增量是 `SUM(...)` 这类聚合调用——由 `parse_primary` 负责。
+    /// 它和 WHERE 的差别不在语法，而在"在哪一步求值、列名空间是什么"。
+    fn parse_having(&mut self) -> Result<Option<Expr>, String> {
+        if self.peek() == &Token::Having {
+            self.advance();
+            Ok(Some(self.parse_expr_or()?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// 解析 `LIMIT n`；没有则返回 None。
     /// n 只接受非负整数字面量：lexer 没有 '-' 分支，`LIMIT -1` 在词法阶段就报错，
     /// 走到这里只可能是写了个别的东西（比如 LIMIT 'x'）。
@@ -477,7 +495,7 @@ impl Parser {
         }
     }
 
-    /// 解析"原子"表达式：列名、数字、字符串、NULL
+    /// 解析"原子"表达式：列名、数字、字符串、NULL、聚合调用
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.advance() {
             // 限定列 table.col：往前多看一个 Dot 才能区分 Column 和 QualifiedColumn
@@ -490,11 +508,41 @@ impl Parser {
                     Ok(Expr::Column(name))
                 }
             }
+            // 聚合调用：函数名 token 已经在 advance() 里被吃掉了
+            Token::Sum   => self.parse_agg_call(AggFunc::Sum),
+            Token::Count => self.parse_agg_call(AggFunc::Count),
+            Token::Avg   => self.parse_agg_call(AggFunc::Avg),
+            Token::Min   => self.parse_agg_call(AggFunc::Min),
+            Token::Max   => self.parse_agg_call(AggFunc::Max),
             Token::Number(n) => Ok(Expr::Literal(LitValue::Number(n))),
             Token::Str(s) => Ok(Expr::Literal(LitValue::Str(s))),
             Token::Null => Ok(Expr::Literal(LitValue::Null)),
             tok => Err(format!("unexpected token in expression: {:?}", tok)),
         }
+    }
+
+    /// 解析聚合调用的剩余部分 `( column )` 或 `( * )`。
+    /// 函数名 token 已经被调用方吃掉了，这里从 `(` 开始。
+    fn parse_agg_call(&mut self, func: AggFunc) -> Result<Expr, String> {
+        self.expect(&Token::LParen)?;
+        let column = if self.peek() == &Token::Star {
+            // 只有 COUNT(*) 合法：SUM(*) 数什么？
+            if func != AggFunc::Count {
+                return Err(format!("{:?}(*) is not allowed, only COUNT(*)", func));
+            }
+            self.advance();
+            "*".to_string()
+        } else {
+            // 允许 SUM(orders.amount) 这种限定列
+            let mut name = self.expect_ident()?;
+            if self.peek() == &Token::Dot {
+                self.advance();
+                name = format!("{}.{}", name, self.expect_ident()?);
+            }
+            name
+        };
+        self.expect(&Token::RParen)?;
+        Ok(Expr::Aggregate { func, column })
     }
 }
 
@@ -540,6 +588,7 @@ mod tests {
             group_by: vec![],
             order_by: vec![],
             limit: None,
+            having: None,
         });
     }
 
@@ -557,6 +606,7 @@ mod tests {
             group_by: vec![],
             order_by: vec![],
             limit: None,
+            having: None,   
         });
     }
 
@@ -577,6 +627,7 @@ mod tests {
             group_by: vec![],
             order_by: vec![],
             limit: None,
+            having: None,   
         });
     }
 
@@ -802,6 +853,7 @@ mod tests {
             group_by: vec![],
             order_by: vec![],
             limit: None,
+            having: None,
         });
     }
     #[test]
@@ -839,6 +891,40 @@ mod tests {
         let s = parse_sql("SELECT * FROM t LIMIT 0").unwrap();
         match s {
             Statement::Select { limit, .. } => assert_eq!(limit, Some(0)),
+            other => panic!("got {:?}", other),
+        }
+    }
+    #[test]
+    fn test_having_parses_aggregate() {
+        // ① 聚合出现在条件左边：SUM(amount) > 100
+        let s = parse_sql(
+            "SELECT dept, SUM(amount) FROM t GROUP BY dept HAVING SUM(amount) > 100").unwrap();
+        match s {
+            Statement::Select { having: Some(h), .. } => assert_eq!(
+                h,
+                Expr::BinOp {
+                    left: Box::new(Expr::Aggregate { func: AggFunc::Sum, column: "amount".into() }),
+                    op: BinOp::Gt,
+                    right: Box::new(Expr::Literal(LitValue::Number(100))),
+                }
+            ),
+            other => panic!("got {:?}", other),
+        }
+
+        // ② COUNT(*) 也要能在条件里出现
+        let s = parse_sql(
+            "SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1").unwrap();
+        match s {
+            Statement::Select { having: Some(Expr::BinOp { left, .. }), .. } => {
+                assert_eq!(*left, Expr::Aggregate { func: AggFunc::Count, column: "*".into() });
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // ③ 没有 HAVING 时是 None，不是"空条件"
+        let s = parse_sql("SELECT dept FROM t GROUP BY dept").unwrap();
+        match s {
+            Statement::Select { having, .. } => assert_eq!(having, None),
             other => panic!("got {:?}", other),
         }
     }

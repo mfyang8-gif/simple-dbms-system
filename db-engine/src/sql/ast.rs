@@ -25,7 +25,12 @@ pub enum Statement {
         joins: Vec<JoinClause>,
         filter: Option<Expr>,
         group_by: Vec<String>,
+        /// HAVING：对"分组后的每一组"再过滤。
+        /// 与 WHERE 的区别：WHERE 在分组前、作用于原始行；HAVING 在分组后、作用于每组的聚合值。
+        /// 注意 None ≠ "无条件"，而是"没写 HAVING"；写了就一定在 aggregate 分支执行。
+        having: Option<Expr>,
         order_by: Vec<OrderByItem>,
+        
         /// LIMIT n；None = 不限。用 Option 而不是 0 表示"不限"，
         /// 因为 LIMIT 0 是合法语句，含义是"返回 0 行"，两者不能混。
         limit: Option<usize>,
@@ -110,6 +115,10 @@ pub enum Expr {
     IsNull { expr: Box<Expr>, negated: bool },
     /// NOT expr——取反；unknown 取反后仍是 unknown（三值逻辑）
     Not(Box<Expr>),
+    /// 表达式里的聚合函数调用：HAVING SUM(amount) > 100 的左边。
+    /// 只允许出现在 HAVING 里；WHERE 里写 SUM(...) 会在执行期报错
+    /// （语义上就不成立：WHERE 求值时还没有"组"）。
+    Aggregate { func: AggFunc, column: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]

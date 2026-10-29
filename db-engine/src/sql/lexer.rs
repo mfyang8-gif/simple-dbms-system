@@ -116,7 +116,7 @@ impl Lexer {
                     "ORDER" => Ok(Token::Order),
                     "ASC" => Ok(Token::Asc),
                     "DESC" => Ok(Token::Desc),
-                   
+                    "HAVING" => Ok(Token::Having),
                     "LIMIT" => Ok(Token::Limit),
                     "BEGIN" => Ok(Token::Begin),
                     "COMMIT" => Ok(Token::Commit),
@@ -305,5 +305,9 @@ mod tests {
                 Token::Group, Token::By, Token::Eof
             ]
         );
+    }
+    #[test]
+    fn test_having_is_keyword() {
+        assert_eq!(tokens("HAVING"), vec![Token::Having, Token::Eof]);
     }
 }

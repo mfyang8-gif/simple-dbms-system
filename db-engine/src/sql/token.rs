@@ -11,7 +11,7 @@ pub enum Token {
     Create, Table, Drop,
     And, Or, Not, Like, Is,
     Join, On,
-    Group, By, Order, Asc, Desc, Limit,
+    Group, By, Order, Asc, Desc, Limit,Having,
     Begin, Commit, Rollback,
     Int, Varchar, Primary, Key, Null, As, Distinct,
     // 列约束关键字
