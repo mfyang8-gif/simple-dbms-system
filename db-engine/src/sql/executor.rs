@@ -154,8 +154,8 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
         }
         Statement::DropTable { name } => execute_drop_table(name, db),
         Statement::Insert { table, columns, values } => execute_insert(table, columns, values, db, session),
-        Statement::Select { columns, table, joins, filter, group_by, order_by, limit, .. } => {
-            execute_select(columns, table, joins, filter, group_by, order_by, limit, db)
+        Statement::Select { columns, table, joins, filter, group_by, having, order_by, limit, .. } => {
+            execute_select(columns, table, joins, filter, group_by, having, order_by, limit, db)
         },
         Statement::Delete { table, filter } => execute_delete(table, filter, db, session),
         Statement::Begin => {
@@ -317,6 +317,20 @@ fn eval_scalar(e: &Expr, col_names: &[String], vals: &[Value]) -> Result<Value, 
         Expr::Literal(LitValue::Number(n)) => Ok(Value::Int(*n)),
         Expr::Literal(LitValue::Str(s)) => Ok(Value::Str(s.clone())),
         Expr::Literal(LitValue::Null) => Ok(Value::Null),
+        // 聚合出现在条件里（HAVING SUM(amount) > 100 的左边）。
+        // 到这一步"每个组"已经算完了，行里存的就是聚合结果，
+        // 所以这里只需要把 (函数名, 列名) 翻译成输出列名 "SUM(amount)"，再去列名空间查下标。
+        Expr::Aggregate { func, column } => {
+            let name = agg_name(func, column);
+            let idx = resolve_column(&name, col_names).map_err(|_| {
+                format!(
+                    "aggregate '{}' is only available in HAVING and must also appear in the SELECT list",
+                    name)
+            })?;
+            let v = vals.get(idx)
+                .ok_or_else(|| format!("aggregate '{}' is not available yet", name))?;
+            Ok(v.clone())
+        }
         other => Err(format!("unsupported scalar: {:?}", other)),
     }
 }
@@ -665,6 +679,7 @@ fn execute_select(
     joins: Vec<JoinClause>,
     filter: Option<Expr>,
     group_by: Vec<String>,
+    having: Option<Expr>,
     order_by: Vec<OrderByItem>,
     limit: Option<usize>,
     db: &mut Database,
@@ -728,10 +743,31 @@ fn execute_select(
     // ⑥ 聚合分支：只要出现聚合函数、或写了 GROUP BY，就走"先分组、再算值"
     //    位置很关键：在 WHERE 之后（先筛行），在投影/ORDER BY 之前（后面排序的是聚合结果）
     let has_agg = columns.iter().any(|c| matches!(c, SelectItem::Aggregate { .. }));
+
+    // HAVING 必须有"组"才成立：GROUP BY 造组，或者聚合把全表当一个组。
+    // 两者都没有时如果放过去，HAVING 会被静默忽略 —— 那是最坏的结果。
+    if having.is_some() && !has_agg && group_by.is_empty() {
+        return Err("HAVING requires GROUP BY or an aggregate function in the SELECT list".into());
+    }
+
     if has_agg || !group_by.is_empty() {
         let (out_names, mut out_rows) =
             aggregate_rows(&columns, &group_by, &col_names, multi, decoded)?;
 
+        // ⑥-1 HAVING：在排序和 LIMIT 之前筛"组"。
+        // 这里的 `?` 在 execute_select 函数体里，不在闭包里，
+        // 所以 SUM(VARCHAR) 这种错误会一路回到客户端，而不是被当成"不匹配"。
+        if let Some(h) = &having {
+            let mut kept: Vec<Vec<Value>> = Vec::with_capacity(out_rows.len());
+            for vals in out_rows {
+                if eval_expr(h, &out_names, &vals)? == Tri::True {
+                    kept.push(vals);
+                }
+            }
+            out_rows = kept;
+        }
+
+        // 聚合之后 "amount" 这种原始列已经不在结果里了，ORDER BY 只能引用输出列
         // 聚合之后 "amount" 这种原始列已经不在结果里了，ORDER BY 只能引用输出列
         let mut sort_keys: Vec<(usize, bool)> = Vec::new();
         for item in &order_by {
@@ -1884,6 +1920,66 @@ mod tests {
             }
             other => panic!("got {:?}", other),
         }
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_having() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE h_sales (id INT PRIMARY KEY, dept VARCHAR(10), amount INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO h_sales VALUES (1, 'A', 100)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO h_sales VALUES (2, 'A', 200)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO h_sales VALUES (3, 'B', 50)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO h_sales VALUES (4, 'C', NULL)").unwrap();
+
+        // ① 分组 + HAVING：A 组 300 留下；B 组 50 被筛掉；
+        //    C 组 SUM 是 NULL → 比较得 Unknown → 也必须被筛掉（不是 false 也不是 true）
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT dept, SUM(amount) FROM h_sales GROUP BY dept HAVING SUM(amount) > 100").unwrap();
+        match r {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["dept".to_string(), "SUM(amount)".to_string()]);
+                assert_eq!(cells_all(&rows), vec![vec!["A".to_string(), "300".to_string()]]);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // ② 我们的取舍：HAVING 引用没出现在 SELECT 里的聚合 → 明确报错
+        let err = exec_sql(&mut db, &mut session,
+                           "SELECT dept FROM h_sales GROUP BY dept HAVING COUNT(*) > 1").unwrap_err();
+        assert!(err.contains("SELECT list"), "错误信息要说清楚限制，got: {}", err);
+
+        // ③ 空输入：没有 HAVING 是 1 行 0；加了 HAVING 就把那一行筛掉了
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT COUNT(*) FROM h_sales WHERE id > 999").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![vec!["0".to_string()]]),
+            other => panic!("got {:?}", other),
+        }
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT COUNT(*) FROM h_sales WHERE id > 999 HAVING COUNT(*) > 0").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 0, "空组存在，但被 HAVING 筛掉了");
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // ④ 没组也没聚合 → 必须报错，不能当 WHERE 用
+        let err = exec_sql(&mut db, &mut session,
+                           "SELECT id FROM h_sales HAVING id > 1").unwrap_err();
+        assert!(err.contains("HAVING"), "got: {}", err);
+
+        // ⑤ 这一条是给"retain + =="写的陷阱检查：
+        //    类型不匹配必须报错出来。如果 HAVING 用 retain/== 实现，
+        //    这里会拿到 0 行而不是 Err，unwrap_err 就 panic 了。
+        let err = exec_sql(&mut db, &mut session,
+                           "SELECT dept, SUM(amount) FROM h_sales GROUP BY dept HAVING SUM(amount) > 'x'").unwrap_err();
+        assert!(err.contains("cannot compare"), "错误不能被吞成 0 行，got: {}", err);
 
         let _ = db.shutdown();
     }
