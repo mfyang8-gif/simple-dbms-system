@@ -371,7 +371,11 @@ fn compare(l: &Value, op: &BinOp, r: &Value) -> Result<Tri, String> {
     }))
 }
 
-/// LIKE 匹配（支持 % 通配符，双指针回溯法）
+/// LIKE 匹配（支持 % 和 _ 两个通配符，双指针回溯法）
+///
+/// `%` = 0 个或多个字符，需要"先少匹配、失败再多一个"的回溯状态；
+/// `_` = 恰好 1 个字符，匹配就前进、没有第二种选择，因此不需要额外状态。
+/// 不支持 ESCAPE：模式里的 `\` 就是普通字符。
 fn like_match(text: &str, pattern: &str) -> bool {
     let t: Vec<char> = text.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
@@ -379,8 +383,9 @@ fn like_match(text: &str, pattern: &str) -> bool {
     let (mut last_star_p, mut last_star_t) = (usize::MAX, 0usize);
 
     while ti < t.len() {
-        if pi < p.len() && p[pi] == t[ti] {
-            ti += 1; pi += 1;                      // 字符相等，双双前进
+        // `_` 与"字符相等"的处理完全一样：占用对端一个字符后双双前进
+        if pi < p.len() && (p[pi] == t[ti] || p[pi] == '_') {
+            ti += 1; pi += 1;                      // 匹配成功，双双前进
         } else if pi < p.len() && p[pi] == '%' {
             last_star_p = pi; last_star_t = ti;    // 记住 % 的位置
             pi += 1;                               // 先假设 % 匹配 0 个字符
@@ -867,6 +872,20 @@ fn execute_select(
             idxs
         }
     };
+    // DISTINCT 时，排序键必须在输出列里。
+    // 否则"这一行按哪个 amount 排"没有定义（见答辩要点：DISTINCT 之后只剩输出列）。
+    if distinct {
+        for item in &order_by {
+            let name = order_key_name(&item.expr)?;
+            let in_output = resolve_column(&name, &col_names)
+                .ok()
+                .map_or(false, |i| proj.contains(&i));
+            if !in_output {
+                return Err(format!(
+                    "ORDER BY '{}' must be a column in the select list when using DISTINCT", name));
+            }
+        }
+    }
 
     // ⑦ ORDER BY（在投影之前排序：可能按没被 SELECT 的列排）
     let mut sort_keys: Vec<(usize, bool)> = Vec::new();
@@ -2149,6 +2168,68 @@ mod tests {
         let r = exec_sql(&mut db, &mut session, "SELECT DISTINCT * FROM dq").unwrap();
         match r {
             ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 6),
+            other => panic!("got {:?}", other),
+        }
+
+        // ⑤ DISTINCT + ORDER BY 非输出列 → 标准禁止，因为排序键在结果里不存在
+        let err = exec_sql(&mut db, &mut session,
+                           "SELECT DISTINCT dept FROM dq ORDER BY amount").unwrap_err();
+        assert!(err.contains("select list"), "got: {}", err);
+
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_like_underscore() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE lk (id INT PRIMARY KEY, name VARCHAR(20))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO lk VALUES (1, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO lk VALUES (2, 'AAlice')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO lk VALUES (3, 'Alxce')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO lk VALUES (4, 'Al')").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO lk VALUES (5, 'Bob')").unwrap();
+
+        // ① `_` 恰好一个字符：'A_ice' 只匹配 5 个字符的 Alice，
+        //    6 个字符的 AAlice 不能匹配（长度不对）
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT name FROM lk WHERE name LIKE 'A_ice'").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![
+                vec!["Alice".to_string()],
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // ② `_` 单独用：'_ob' = 任意 1 个字符 + "ob"
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT name FROM lk WHERE name LIKE '_ob'").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![
+                vec!["Bob".to_string()],
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // ③ `%` 的回溯没被破坏：'Al%ce' 的前缀要吃掉不同长度的中间段
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT name FROM lk WHERE name LIKE 'Al%ce'").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![
+                vec!["Alice".to_string()],
+                vec!["Alxce".to_string()],
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // ④ 长度不匹配：'Al__' 要求恰好 4 个字符，表里没有 → 0 行
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT name FROM lk WHERE name LIKE 'Al__'").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 0),
             other => panic!("got {:?}", other),
         }
 
