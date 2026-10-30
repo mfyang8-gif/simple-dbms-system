@@ -487,10 +487,15 @@ fn authorize(stmt: &Statement, db: &Database, session: &Session) -> Result<(), S
         | Statement::Begin | Statement::Commit | Statement::Rollback => None,
     };
 
-    // ③ bootstrap：库里一个用户都没有 → 不设防。
-    //    否则第一个 CREATE USER 永远发不出去（死锁：要建用户必须先有用户）。
+    // ③ bootstrap：库里一个用户都没有 → 只有本地连接可以不设防。
+    //    这是 MongoDB「localhost exception」的同构做法：不试图消灭窗口
+    //    （只要初始管理员由网络请求触发，先到者必然得手），
+    //    而是把窗口的可达范围从 0.0.0.0 收敛到 127.0.0.1。
     if user_count(db)? == 0 {
-        return Ok(());
+        if session.peer_is_local {
+            return Ok(());
+        }
+        return Err("database has no users yet; bootstrap must come from localhost".into());
     }
 
     // ④ 一旦有了用户，匿名就没有任何权限
@@ -2767,6 +2772,31 @@ mod tests {
         ));
 
         let _ = exec_sql(&mut db, &mut session, "DROP TABLE acp_t");
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_bootstrap_requires_localhost() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+
+        // 模拟一个来自非 loopback 的连接（Session::new() 默认 true，这里手动覆盖）
+        let mut remote = Session::new();
+        remote.peer_is_local = false;
+
+        // 零用户期：远端连 CREATE TABLE 都不行，不只是抢不到 admin
+        assert_err_contains(exec_sql(&mut db, &mut remote, "CREATE TABLE r_t (id INT)"),
+                            "bootstrap must come from localhost");
+        assert_err_contains(exec_sql(&mut db, &mut remote, "CREATE USER eve PASSWORD 'x'"),
+                            "bootstrap must come from localhost");
+
+        // 本地连接仍然可以 bootstrap
+        let mut local = Session::new();
+        exec_sql(&mut db, &mut local, "CREATE USER root3 PASSWORD 'rootpw'").unwrap();
+
+        // 有用户之后，远端看到的是常规提示：不再暴露“库是空的”这件事
+        assert_err_contains(exec_sql(&mut db, &mut remote, "CREATE TABLE r_t (id INT)"),
+                            "please LOGIN first");
+
         let _ = db.shutdown();
     }
 }

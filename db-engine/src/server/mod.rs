@@ -44,9 +44,15 @@ fn handle_client(stream: TcpStream, db: Arc<Mutex<Database>>) -> std::io::Result
         .map(|a| a.ip().is_loopback())
         .unwrap_or(false);
 
+    // 必须在 stream 被 move 进 BufReader 之前取对端地址
+    let peer_is_local = stream.peer_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false);
+
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
     let mut session = Session::new();
+    session.peer_is_local = peer_is_local;
     session.peer_is_local = is_local;
     for line in reader.lines() {
         let line = line?;
@@ -307,4 +313,5 @@ mod tests {
         assert!(out.contains("NULL"), "got: {}", out);
         assert!(out.contains("(1 row(s))"));
     }
+
 }
