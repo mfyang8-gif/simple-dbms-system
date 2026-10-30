@@ -148,7 +148,14 @@ impl Parser {
         }
         Ok(cols)
     }
-    /// 解析 ORDER BY col [ASC|DESC] [, col ...]；没有则返回空 vec
+    /// 解析 ORDER BY <键> [ASC|DESC] [, ...]；没有则返回空 vec。
+    ///
+    /// 排序键交给 `parse_primary`，三种写法自动都支持：
+    ///   ORDER BY dept            裸列   → Expr::Column
+    ///   ORDER BY users.dept      限定列 → Expr::QualifiedColumn
+    ///   ORDER BY SUM(amount)     聚合   → Expr::Aggregate
+    /// 顺带把原来"手写 ident + 可选 Dot"那几行删了：
+    /// table.col 的解析规则只该有一处实现，就在这里复用。
     fn parse_order_by(&mut self) -> Result<Vec<OrderByItem>, String> {
         let mut items = Vec::new();
         if self.peek() != &Token::Order {
@@ -158,18 +165,13 @@ impl Parser {
         self.expect(&Token::By)?;    // BY
 
         loop {
-            let mut column = self.expect_ident()?;
-            // 支持 ORDER BY users.id（JOIN 场景必须能写限定列）
-            if self.peek() == &Token::Dot {
-                self.advance();
-                column = format!("{}.{}", column, self.expect_ident()?);
-            }
+            let expr = self.parse_primary()?;
             let asc = match self.peek() {
                 Token::Asc  => { self.advance(); true }
                 Token::Desc => { self.advance(); false }
                 _ => true,           // 默认升序
             };
-            items.push(OrderByItem { column, asc });
+            items.push(OrderByItem { expr, asc });
 
             if self.peek() != &Token::Comma { break; }
             self.advance();
@@ -745,8 +747,8 @@ mod tests {
         match s {
             Statement::Select { order_by, .. } => {
                 assert_eq!(order_by, vec![
-                    OrderByItem { column: "a".into(), asc: false },
-                    OrderByItem { column: "b".into(), asc: true },
+                    OrderByItem { expr: Expr::Column("a".into()), asc: false },
+                    OrderByItem { expr: Expr::Column("b".into()), asc: true },
                 ]);
             }
             other => panic!("expected Select, got {:?}", other),
@@ -925,6 +927,34 @@ mod tests {
         let s = parse_sql("SELECT dept FROM t GROUP BY dept").unwrap();
         match s {
             Statement::Select { having, .. } => assert_eq!(having, None),
+            other => panic!("got {:?}", other),
+        }
+    }
+    #[test]
+    fn test_order_by_aggregate_and_qualified() {
+        // ① 排序键是聚合调用
+        let s = parse_sql(
+            "SELECT dept, SUM(amount) FROM t GROUP BY dept ORDER BY SUM(amount) DESC").unwrap();
+        match s {
+            Statement::Select { order_by, .. } => assert_eq!(order_by, vec![
+                OrderByItem {
+                    expr: Expr::Aggregate { func: AggFunc::Sum, column: "amount".into() },
+                    asc: false,
+                },
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // ② 限定列不能因为换了实现就退化
+        let s = parse_sql("SELECT * FROM t ORDER BY t.id DESC, name").unwrap();
+        match s {
+            Statement::Select { order_by, .. } => assert_eq!(order_by, vec![
+                OrderByItem {
+                    expr: Expr::QualifiedColumn { table: "t".into(), col: "id".into() },
+                    asc: false,
+                },
+                OrderByItem { expr: Expr::Column("name".into()), asc: true },
+            ]),
             other => panic!("got {:?}", other),
         }
     }

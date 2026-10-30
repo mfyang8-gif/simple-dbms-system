@@ -296,6 +296,23 @@ fn resolve_column(name: &str, col_names: &[String]) -> Result<usize, String> {
 fn short_name(full: &str) -> &str {
     full.rsplit_once('.').map(|(_, c)| c).unwrap_or(full)
 }
+/// 把"排序键表达式"归一成列名，再交给 `resolve_column` 查下标。
+///
+/// 为什么需要这一步：排序发生在两个不同的列名空间里——
+///   普通查询 → col_names = ["t.a", "t.b"]
+///   聚合查询 → out_names = ["dept", "SUM(amount)"]
+/// 把 Expr 先翻成"名字"，两条路就能共用同一个 resolve_column。
+fn order_key_name(e: &Expr) -> Result<String, String> {
+    match e {
+        Expr::Column(name) => Ok(name.clone()),
+        Expr::QualifiedColumn { table, col } => Ok(format!("{}.{}", table, col)),
+        // 关键一行：聚合键和 SELECT 列表里的聚合用同一个 agg_name 拼名字，
+        // 所以 "ORDER BY SUM(amount)" 能精确命中输出列 "SUM(amount)"
+        Expr::Aggregate { func, column } => Ok(agg_name(func, column)),
+        other => Err(format!(
+            "ORDER BY only supports a column or an aggregate function, got {:?}", other)),
+    }
+}
 /// 评估标量表达式（列名查表 → 下标 → 从当前行取值）
 fn eval_scalar(e: &Expr, col_names: &[String], vals: &[Value]) -> Result<Value, String> {
     match e {
@@ -767,13 +784,11 @@ fn execute_select(
             out_rows = kept;
         }
 
-        // 聚合之后 "amount" 这种原始列已经不在结果里了，ORDER BY 只能引用输出列
-        // 聚合之后 "amount" 这种原始列已经不在结果里了，ORDER BY 只能引用输出列
         let mut sort_keys: Vec<(usize, bool)> = Vec::new();
         for item in &order_by {
-            let idx = resolve_column(&item.column, &out_names).map_err(|_| {
-                format!("ORDER BY '{}' must be a column in the select list when aggregating",
-                        item.column)
+            let name = order_key_name(&item.expr)?;
+            let idx = resolve_column(&name, &out_names).map_err(|_| {
+                format!("ORDER BY '{}' must be a column in the select list when aggregating", name)
             })?;
             sort_keys.push((idx, item.asc));
         }
@@ -824,7 +839,15 @@ fn execute_select(
     // ⑦ ORDER BY（在投影之前排序：可能按没被 SELECT 的列排）
     let mut sort_keys: Vec<(usize, bool)> = Vec::new();
     for item in &order_by {
-        sort_keys.push((resolve_column(&item.column, &col_names)?, item.asc));
+        // 走到这里说明 SELECT 里没有任何聚合函数，也就没有"组"可算。
+        // 必须在这里挡住：否则会掉进 resolve_column 报 "column 'SUM(amount)' not found"，
+        // 让人以为列名写错了，而不是"这个位置不能放聚合"。
+        if matches!(&item.expr, Expr::Aggregate { .. }) {
+            return Err(
+                "ORDER BY cannot use an aggregate function unless the query aggregates".into());
+        }
+        let name = order_key_name(&item.expr)?;
+        sort_keys.push((resolve_column(&name, &col_names)?, item.asc));
     }
     if !sort_keys.is_empty() {
         decoded.sort_by(|a, b| {
@@ -1980,6 +2003,53 @@ mod tests {
         let err = exec_sql(&mut db, &mut session,
                            "SELECT dept, SUM(amount) FROM h_sales GROUP BY dept HAVING SUM(amount) > 'x'").unwrap_err();
         assert!(err.contains("cannot compare"), "错误不能被吞成 0 行，got: {}", err);
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_order_by_aggregate() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE o_agg (id INT PRIMARY KEY, dept VARCHAR(10), amount INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO o_agg VALUES (1, 'A', 100)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO o_agg VALUES (2, 'A', 200)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO o_agg VALUES (3, 'B', 500)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO o_agg VALUES (4, 'B', 50)").unwrap();
+
+        // ① ORDER BY SUM(amount) DESC：A=300、B=550 → B 在前
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT dept, SUM(amount) FROM o_agg GROUP BY dept ORDER BY SUM(amount) DESC").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![
+                vec!["B".to_string(), "550".to_string()],
+                vec!["A".to_string(), "300".to_string()],
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // ② 排序键换成聚合结果本身以外的东西：按分组列排
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT dept, SUM(amount) FROM o_agg GROUP BY dept ORDER BY dept DESC").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![
+                vec!["B".to_string(), "550".to_string()],
+                vec!["A".to_string(), "300".to_string()],
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // ③ 引用了不在 SELECT 里的聚合 → 明确报错（不是 "column not found"）
+        let err = exec_sql(&mut db, &mut session,
+                           "SELECT dept FROM o_agg GROUP BY dept ORDER BY SUM(amount)").unwrap_err();
+        assert!(err.contains("ORDER BY"), "got: {}", err);
+
+        // ④ 非聚合查询里用聚合排序 → 明确报错
+        let err = exec_sql(&mut db, &mut session,
+                           "SELECT id FROM o_agg ORDER BY SUM(amount)").unwrap_err();
+        assert!(err.contains("aggregate"), "got: {}", err);
 
         let _ = db.shutdown();
     }

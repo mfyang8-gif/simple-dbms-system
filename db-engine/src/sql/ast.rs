@@ -67,10 +67,13 @@ pub enum AggFunc {
     Sum, Count, Avg, Min, Max,
 }
 
-/// ORDER BY 的一项：列名 + 方向
+/// ORDER BY 的一项：排序键 + 方向
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderByItem {
-    pub column: String,
+    /// 排序键用 Expr 而不是 String，是为了让 `ORDER BY SUM(amount)`
+    /// 和 `HAVING SUM(amount) > 100` 共用同一套表达式解析——
+    /// 同一个 SQL 概念（聚合调用）在 AST 里只有一种表示。
+    pub expr: Expr,
     pub asc: bool,   // true = ASC（默认），false = DESC
 }
 
