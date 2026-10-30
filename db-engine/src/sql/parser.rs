@@ -73,6 +73,15 @@ impl Parser {
 
     fn parse_select(&mut self) -> Result<Statement, String> {
         self.expect(&Token::Select)?;
+        // DISTINCT 紧跟在 SELECT 后面，只吃一个 token，
+        // 之后还是普通的列列表（DISTINCT 不是"选择项"，是整条 SELECT 的修饰）。
+        let distinct = if self.peek() == &Token::Distinct {
+            self.advance();
+            true
+        } else {
+            false
+        };
+       
         let columns = self.parse_select_items()?;
         self.expect(&Token::From)?;
         let table = self.expect_ident()?;
@@ -90,8 +99,10 @@ impl Parser {
         let order_by = self.parse_order_by()?;
         // LIMIT 是整条 SELECT 的最后一个子句，必须在 ORDER BY 之后解析
         let limit = self.parse_limit()?;
-        Ok(Statement::Select { columns, table, filter, joins, group_by, having, order_by, limit })
-            }
+        Ok(Statement::Select {
+            distinct, columns, table, filter, joins, group_by, having, order_by, limit,
+        })
+    }
 
     /// 解析 `JOIN <table> ON <a.col> = <b.col>`，支持连续多个 JOIN。
     /// 当前只支持等值连接：任务书里的"多表连接"用等值已经够，
@@ -583,6 +594,7 @@ mod tests {
     fn test_select_star_from() {
         let stmt = parse_sql("SELECT * FROM users").unwrap();
         assert_eq!(stmt, Statement::Select {
+            distinct: false,
             columns: vec![SelectItem::Star],
             table: "users".into(),
             filter: None,
@@ -598,6 +610,7 @@ mod tests {
     fn test_select_columns() {
         let stmt = parse_sql("SELECT name, age FROM users").unwrap();
         assert_eq!(stmt, Statement::Select {
+            distinct: false,
             columns: vec![
                 SelectItem::Column("name".into()),
                 SelectItem::Column("age".into()),
@@ -622,6 +635,7 @@ mod tests {
     fn test_with_semicolon() {
         let stmt = parse_sql("SELECT * FROM t;").unwrap();
         assert_eq!(stmt, Statement::Select {
+            distinct: false,
             columns: vec![SelectItem::Star],
             table: "t".into(),
             filter: None,
@@ -844,6 +858,7 @@ mod tests {
         let stmt = parse_sql(
             "SELECT * FROM logs JOIN materials ON logs.material_code = materials.material_code").unwrap();
         assert_eq!(stmt, Statement::Select {
+            distinct: false,
             columns: vec![SelectItem::Star],
             table: "logs".into(),
             filter: None,
@@ -955,6 +970,24 @@ mod tests {
                 },
                 OrderByItem { expr: Expr::Column("name".into()), asc: true },
             ]),
+            other => panic!("got {:?}", other),
+        }
+    }
+    #[test]
+    fn test_distinct_parses() {
+        let s = parse_sql("SELECT DISTINCT dept FROM t").unwrap();
+        match s {
+            Statement::Select { distinct, columns, .. } => {
+                assert!(distinct);
+                assert_eq!(columns, vec![SelectItem::Column("dept".into())]);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // 没写 DISTINCT 必须是 false（防止"默认 true"这种低级错）
+        let s = parse_sql("SELECT dept FROM t").unwrap();
+        match s {
+            Statement::Select { distinct, .. } => assert!(!distinct),
             other => panic!("got {:?}", other),
         }
     }

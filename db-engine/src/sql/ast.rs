@@ -20,6 +20,7 @@ pub enum Statement {
     },
     /// SELECT name, age FROM users WHERE age > 18
     Select {
+        distinct: bool,
         columns: Vec<SelectItem>,
         table: String,
         joins: Vec<JoinClause>,

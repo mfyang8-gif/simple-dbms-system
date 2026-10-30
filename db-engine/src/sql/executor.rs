@@ -154,8 +154,8 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
         }
         Statement::DropTable { name } => execute_drop_table(name, db),
         Statement::Insert { table, columns, values } => execute_insert(table, columns, values, db, session),
-        Statement::Select { columns, table, joins, filter, group_by, having, order_by, limit, .. } => {
-            execute_select(columns, table, joins, filter, group_by, having, order_by, limit, db)
+        Statement::Select { distinct, columns, table, joins, filter, group_by, having, order_by, limit, .. } => {
+            execute_select(columns, distinct, table, joins, filter, group_by, having, order_by, limit, db)
         },
         Statement::Delete { table, filter } => execute_delete(table, filter, db, session),
         Statement::Begin => {
@@ -690,8 +690,32 @@ fn aggregate_rows(
 
     Ok((out_names, out_rows))
 }
+
+/// DISTINCT：按"输出列的值"去重，保留首次出现的那一行。
+///
+/// key_idx 是"输出列在整行里的下标"，两个分支各传各的：
+///   普通查询  → proj（SELECT 了哪几列）
+///   聚合查询  → 0..out_names.len()（整行就是输出）
+///
+/// 用 to_cell() 得到的 Option<String> 当 key，和 aggregate_rows 的分组键同一套规则：
+/// NULL 是 None，字符串 'NULL' 是 Some("NULL")，两者不会撞车。
+///
+/// 调用前必须已经排好序：DISTINCT 保留"首个"，所以去掉哪些重复行取决于顺序，
+/// 但保留下来的行仍然维持排序后的相对顺序。
+fn take_distinct(rows: Vec<Vec<Value>>, key_idx: &[usize]) -> Vec<Vec<Value>> {
+    let mut seen: HashSet<Vec<Option<String>>> = HashSet::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let key: Vec<Option<String>> = key_idx.iter().map(|&i| row[i].to_cell()).collect();
+        if seen.insert(key) {
+            out.push(row);
+        }
+    }
+    out
+}
 fn execute_select(
     columns: Vec<SelectItem>,
+    distinct: bool,
     table_name: String,
     joins: Vec<JoinClause>,
     filter: Option<Expr>,
@@ -803,6 +827,14 @@ fn execute_select(
                 Ordering::Equal
             });
         }
+        // ⑩ DISTINCT 对聚合结果同样生效：
+        //    SELECT DISTINCT SUM(amount) FROM t GROUP BY dept → 两个组 SUM 相同时只留一行
+        //    位置：排序之后、LIMIT 之前（先截断再去重会少给行）
+        if distinct {
+            let all_cols: Vec<usize> = (0..out_names.len()).collect();
+            out_rows = take_distinct(out_rows, &all_cols);
+        }
+
         if let Some(limit) = limit {
             out_rows = out_rows.into_iter().take(limit).collect();
         }
@@ -860,10 +892,16 @@ fn execute_select(
             Ordering::Equal
         });
     }
+    // ⑨ DISTINCT：按 proj 指定的输出列去重。
+    //    必须在 LIMIT 之前 —— 否则 SELECT DISTINCT dept ... LIMIT 2
+    //    会先取到 A,A 再去重，只剩 1 行。
+    if distinct {
+        decoded = take_distinct(decoded, &proj);
+    }
+
     if let Some(limit) = limit {
         decoded = decoded.into_iter().take(limit).collect();
     }
-
 
     // ⑧ 投影落地 + 输出列名（多表时就是 "表名.列名"）
     let rows: Vec<Vec<Option<String>>> = decoded
@@ -2050,6 +2088,69 @@ mod tests {
         let err = exec_sql(&mut db, &mut session,
                            "SELECT id FROM o_agg ORDER BY SUM(amount)").unwrap_err();
         assert!(err.contains("aggregate"), "got: {}", err);
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_distinct() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE dq (id INT PRIMARY KEY, dept VARCHAR(10), amount INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO dq VALUES (1, 'A', 100)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO dq VALUES (2, 'A', 100)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO dq VALUES (3, 'A', 200)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO dq VALUES (4, 'B', 100)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO dq VALUES (5, NULL, 100)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO dq VALUES (6, NULL, 100)").unwrap();
+
+        // ① 单列去重：A / B / NULL 各一行；NULL 排最前（cmp_for_sort 的规则）
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT DISTINCT dept FROM dq ORDER BY dept").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![
+                vec!["NULL".to_string()],
+                vec!["A".to_string()],
+                vec!["B".to_string()],
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // ② 多列去重：按 (dept, amount) 组合，(A,100) 那两行只留一行
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT DISTINCT dept, amount FROM dq ORDER BY dept, amount").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![
+                vec!["NULL".to_string(), "100".to_string()],
+                vec!["A".to_string(), "100".to_string()],
+                vec!["A".to_string(), "200".to_string()],
+                vec!["B".to_string(), "100".to_string()],
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // ③ 顺序陷阱：DISTINCT 必须在 LIMIT 之前。
+        //    插入顺序是 A,A,A,B,NULL,NULL。
+        //    先 LIMIT 2 拿到 A,A → 去重 → 只剩 1 行（错）；
+        //    先去重拿到 A,B,NULL → LIMIT 2 → A,B（对）。
+        let r = exec_sql(&mut db, &mut session,
+                         "SELECT DISTINCT dept FROM dq LIMIT 2").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![
+                vec!["A".to_string()],
+                vec!["B".to_string()],
+            ]),
+            other => panic!("got {:?}", other),
+        }
+
+        // ④ SELECT DISTINCT *：按整行去重，主键各不相同 → 6 行全留
+        let r = exec_sql(&mut db, &mut session, "SELECT DISTINCT * FROM dq").unwrap();
+        match r {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 6),
+            other => panic!("got {:?}", other),
+        }
 
         let _ = db.shutdown();
     }
