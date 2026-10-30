@@ -21,7 +21,16 @@ pub enum ResultSet {
 /// 每个 TCP 连接一份，跨语句保持事务状态
 pub struct Session {
     pub txn_id: Option<u64>,   // 当前活跃事务 ID；None 表示不在事务中
+    /// 当前登录用户。None = 匿名。
+    /// 它跟着「连接」走（server 每条连接一个 Session），
+    /// 所以两个客户端可以同时是不同用户，事务和身份都互不干扰。
+    pub user: Option<String>,
+    /// 这条连接是否来自回环地址。零用户期的 bootstrap 只允许本地。
+    /// REPL 与单元测试没有网络对端，构造时默认 true；
+    /// 网络连接在 server/mod.rs 里用真实 peer 地址显式覆盖。
+    pub peer_is_local: bool,
 }
+
 fn ast_col_to_column(def: ColumnDef) -> Column {
     let base = match def.data_type {
         DataType::Int => Column::int(&def.name),
@@ -143,11 +152,390 @@ fn execute_create_table(name: String, columns: Vec<ColumnDef>, db: &mut Database
 }
 
 impl Session {
-    pub fn new() -> Self { Self { txn_id: None } }
+    pub fn new() -> Self {
+        Self { txn_id: None, user: None, peer_is_local: true }
+    }
+}
+// ==================== 访问控制：内部表 ====================
+// 为什么用「内部表」而不是另开一个 users.db：
+// 能白拿 Table 的 WAL、Catalog、FreePageManager、事务和崩溃恢复。
+// 代价只是这两张表会出现在 list_tables() 里（交付报告里写明即可）。
+
+const USERS_TABLE: &str = "__minidb_users";
+const PRIVS_TABLE: &str = "__minidb_privs";
+pub const INTERNAL_PREFIX: &str = "__minidb_";
+
+/// 口令摘要：FNV-1a 64 位 → 16 个十六进制字符。
+/// 零依赖、确定、可重复；但它**不是 KDF**（无 salt、无迭代），
+/// 报告里必须写明“生产环境应换 bcrypt / argon2”。
+fn hash_password(plain: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in plain.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:016x}", hash)
+}
+
+/// 幂等：两张表不在就建。每条 DCL 语句进来前调一次。
+/// 内部表由 catalog.create_table 创建，它内部会 flush（走 WAL），所以天然崩溃安全。
+fn ensure_internal_tables(db: &mut Database) -> Result<(), String> {
+    if db.get_table_meta(USERS_TABLE).is_none() {
+        db.create_table(USERS_TABLE, vec![
+            // 用户名当主键：唯一列判定是逐列独立的，单列做主键才拦得住重名
+            Column::varchar("username", 64).primary_key(),
+            // 定 64 不是 16：将来换 bcrypt(60 字符) 不用改表结构
+            Column::varchar("pwd_hash", 64).not_null(),
+            Column::int("is_admin").not_null(),
+        ]).map_err(|e| format!("create {}: {}", USERS_TABLE, e))?;
+    }
+
+    if db.get_table_meta(PRIVS_TABLE).is_none() {
+        db.create_table(PRIVS_TABLE, vec![
+            // grant_key = "user|table|PRIV"，用单列字符串拼出复合主键。
+            // 不能建三列复合主键：本引擎的唯一约束是「逐列独立判定」，
+            // 多列放在一起不构成复合键。
+            Column::varchar("grant_key", 200).primary_key(),
+            Column::varchar("username", 64).not_null(),
+            Column::varchar("table_name", 64).not_null(),
+            Column::varchar("priv_name", 8).not_null(),
+        ]).map_err(|e| format!("create {}: {}", PRIVS_TABLE, e))?;
+    }
+    Ok(())
 }
 
 /// 执行一条 AST，返回结果集
+// ==================== 访问控制：DCL 执行 ====================
+
+fn execute_create_user(
+    name: String,
+    password: String,
+    db: &mut Database,
+    session: &mut Session,
+) -> Result<ResultSet, String> {
+    ensure_internal_tables(db)?;
+
+    let mut users = db
+        .open_table(USERS_TABLE)
+        .map_err(|e| format!("open {}: {}", USERS_TABLE, e))?;
+
+    // bootstrap：零用户时，第一个 CREATE USER 的用户自动成为 admin。
+    // 判据是「表里有几行」，不是「有没有 is_admin=1 的行」——
+    // 后者在 admin 被删光后会凭空冒出一个新 admin，等于权限可以“重新洗牌”。
+    let is_first = users.scan_all().map_err(|e| e.to_string())?.is_empty();
+    let is_admin = if is_first { 1 } else { 0 };
+
+    let hash = hash_password(&password);
+    let row = users
+        .new_row()
+        .put_varchar(&name).map_err(|e| e.to_string())?
+        .put_varchar(&hash).map_err(|e| e.to_string())?
+        .put_int(is_admin).map_err(|e| e.to_string())?
+        .build().map_err(|e| e.to_string())?;
+
+    // 加入当前事务：BEGIN; CREATE USER ...; ROLLBACK 时这个用户会一起消失。
+    // 这是与表数据一致的事务语义，属于可接受边界（要写进报告）。
+    db.insert_in_txn(&mut users, row, session.txn_id)
+        .map_err(|e| format!("create user failed: {}", e))?;
+
+    // 非第一个用户的 admin 校验不在这里做：4-E 的 authorize 统一拦，
+    // 避免同一件事写两遍再删一遍。
+    Ok(ResultSet::Ok)
+}
+
+fn execute_login(
+    name: String,
+    password: String,
+    db: &mut Database,
+    session: &mut Session,
+) -> Result<ResultSet, String> {
+    // 事务中禁止切身份：否则同一事务前半段是 A 的权限、后半段是 B 的，
+    // 回滚时也无法解释“这条插入是谁做的”。
+    if session.txn_id.is_some() {
+        return Err("LOGIN is not allowed inside a transaction".into());
+    }
+
+    // LOGIN 是只读操作：零用户时不调 ensure_internal_tables
+    // （否则“登录失败”会顺手在库里建出两张表，纯副作用）。
+    if db.get_table_meta(USERS_TABLE).is_none() {
+        return Err("invalid username or password".into());
+    }
+
+    let users = db
+        .open_table(USERS_TABLE)
+        .map_err(|e| format!("open {}: {}", USERS_TABLE, e))?;
+
+    let want = hash_password(&password);
+    for (_, record) in users.scan_all().map_err(|e| e.to_string())? {
+        let vals = decode_row(&users, &record)?;
+        let (u, h) = match (vals.first(), vals.get(1)) {
+            (Some(Value::Str(u)), Some(Value::Str(h))) => (u, h),
+            _ => continue,
+        };
+        if u == &name {
+            if h != &want {
+                return Err("invalid username or password".into());
+            }
+            session.user = Some(name);
+            return Ok(ResultSet::Ok);
+        }
+    }
+
+    // 与“密码错”用同一句：否则外部可以靠报错文案枚举出哪些用户名存在
+    Err("invalid username or password".into())
+}
+// ==================== 访问控制：授权 ====================
+
+fn priv_name(p: Priv) -> &'static str {
+    match p {
+        Priv::Select => "SELECT",
+        Priv::Insert => "INSERT",
+        Priv::Update => "UPDATE",
+        Priv::Delete => "DELETE",
+    }
+}
+
+/// 权限的主键：单列字符串。不能用三列复合主键——
+/// 本引擎的唯一约束是逐列独立判定的（table/mod.rs:679）。
+fn grant_key(user: &str, table: &str, p: Priv) -> String {
+    format!("{}|{}|{}", user, table, priv_name(p))
+}
+
+fn user_exists(db: &Database, user: &str) -> Result<bool, String> {
+    if db.get_table_meta(USERS_TABLE).is_none() {
+        return Ok(false);
+    }
+    let t = db.open_table(USERS_TABLE).map_err(|e| e.to_string())?;
+    for (_, rec) in t.scan_all().map_err(|e| e.to_string())? {
+        let vals = decode_row(&t, &rec)?;
+        if let Some(Value::Str(u)) = vals.first() {
+            if u.as_str() == user {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn execute_grant(
+    privs: Vec<Priv>,
+    table: String,
+    user: String,
+    db: &mut Database,
+    session: &mut Session,
+) -> Result<ResultSet, String> {
+    // GRANT 是写操作，两张内部表必须存在
+    ensure_internal_tables(db)?;
+
+    // ① 表必须真实存在。否则会留下一条「幽灵权限」：
+    //    今天给不存在的 del_log 授权，明年有人建了 del_log，权限突然生效。
+    if db.get_table_meta(&table).is_none() {
+        return Err(format!("table '{}' does not exist", table));
+    }
+
+    // ② 用户必须真实存在。否则就是「给未来的同名用户预埋权限」，
+    //    本质上是后门：攻击者先 GRANT，再等你建出这个用户。
+    if !user_exists(db, &user)? {
+        return Err(format!("user '{}' does not exist", user));
+    }
+
+    let mut privs_tbl = db
+        .open_table(PRIVS_TABLE)
+        .map_err(|e| format!("open {}: {}", PRIVS_TABLE, e))?;
+
+    // ③ 幂等：SQL 标准里重复 GRANT 不算错。先把已有主键收进集合，
+    //    只插缺的那些——顺便避免了“靠解析错误字符串判断重复”的脆弱做法。
+    let mut existing: HashSet<String> = HashSet::new();
+    for (_, rec) in privs_tbl.scan_all().map_err(|e| e.to_string())? {
+        let vals = decode_row(&privs_tbl, &rec)?;
+        if let Some(Value::Str(k)) = vals.first() {
+            existing.insert(k.clone());
+        }
+    }
+
+    let mut inserted = 0usize;
+    for p in privs {
+        let key = grant_key(&user, &table, p);
+        // insert 返回 false = 集合里已经有这条 → 这一次什么都不用做
+        // 这一行同时解决了两种情况：库里已有 和 本语句内重复
+        if !existing.insert(key.clone()) {
+            continue;
+        }
+        let row = privs_tbl
+            .new_row()
+            .put_varchar(&key).map_err(|e| e.to_string())?
+            .put_varchar(&user).map_err(|e| e.to_string())?
+            .put_varchar(&table).map_err(|e| e.to_string())?
+            .put_varchar(priv_name(p)).map_err(|e| e.to_string())?
+            .build().map_err(|e| e.to_string())?;
+
+        db.insert_in_txn(&mut privs_tbl, row, session.txn_id)
+            .map_err(|e| format!("grant failed: {}", e))?;
+        inserted += 1;
+    }
+
+    // 返回实际新增条数：重复 GRANT 会得到 0，客户端能看出“这次什么都没变”
+    Ok(ResultSet::Affected(inserted))
+}
+
+fn execute_revoke(
+    privs: Vec<Priv>,
+    table: String,
+    user: String,
+    db: &mut Database,
+    session: &mut Session,
+) -> Result<ResultSet, String> {
+    // 从来没 GRANT 过（表都不存在）→ 撤权是空操作，不是错误。
+    // REVOKE 的语义是“确保这条权限不存在”，已经达成就返回 0。
+    if db.get_table_meta(PRIVS_TABLE).is_none() {
+        return Ok(ResultSet::Affected(0));
+    }
+
+    let mut privs_tbl = db
+        .open_table(PRIVS_TABLE)
+        .map_err(|e| format!("open {}: {}", PRIVS_TABLE, e))?;
+
+    let targets: HashSet<String> = privs.iter().map(|p| grant_key(&user, &table, *p)).collect();
+
+    // 先收齐 row_id，再统一删。这个实现里 scan_all() 返回的是 Vec 快照，
+    // 边扫边删也能跑；但代码要按接口契约写，不能依赖“当前实现恰好物化了”。
+    let mut doomed: Vec<RowId> = Vec::new();
+    for (rid, rec) in privs_tbl.scan_all().map_err(|e| e.to_string())? {
+        let vals = decode_row(&privs_tbl, &rec)?;
+        if let Some(Value::Str(k)) = vals.first() {
+            if targets.contains(k) {
+                doomed.push(rid);
+            }
+        }
+    }
+
+    let removed = doomed.len();
+    for rid in doomed {
+        privs_tbl
+            .delete(rid, db.txn_mgr(), session.txn_id)
+            .map_err(|e| format!("revoke failed: {}", e))?;
+    }
+    Ok(ResultSet::Affected(removed))
+}
+// ==================== 访问控制：唯一闸门 ====================
+
+fn user_count(db: &Database) -> Result<usize, String> {
+    if db.get_table_meta(USERS_TABLE).is_none() {
+        return Ok(0);
+    }
+    let t = db.open_table(USERS_TABLE).map_err(|e| e.to_string())?;
+    Ok(t.scan_all().map_err(|e| e.to_string())?.len())
+}
+
+fn is_admin(db: &Database, user: &str) -> Result<bool, String> {
+    if db.get_table_meta(USERS_TABLE).is_none() {
+        return Ok(false);
+    }
+    let t = db.open_table(USERS_TABLE).map_err(|e| e.to_string())?;
+    for (_, rec) in t.scan_all().map_err(|e| e.to_string())? {
+        let vals = decode_row(&t, &rec)?;
+        if let (Some(Value::Str(u)), Some(Value::Int(a))) = (vals.first(), vals.get(2)) {
+            if u.as_str() == user {
+                return Ok(*a != 0);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn has_priv(db: &Database, user: &str, table: &str, p: Priv) -> Result<bool, String> {
+    if db.get_table_meta(PRIVS_TABLE).is_none() {
+        return Ok(false);
+    }
+    let t = db.open_table(PRIVS_TABLE).map_err(|e| e.to_string())?;
+    let key = grant_key(user, table, p);
+    for (_, rec) in t.scan_all().map_err(|e| e.to_string())? {
+        let vals = decode_row(&t, &rec)?;
+        if let Some(Value::Str(k)) = vals.first() {
+            if k == &key {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn authorize(stmt: &Statement, db: &Database, session: &Session) -> Result<(), String> {
+    // ① 事务控制与 LOGIN 本身一律放行。
+    //    BEGIN/COMMIT/ROLLBACK 必须放行：连接断开时 server 会自动发一条 ROLLBACK
+    //    （server/mod.rs:74-78），那是在“未登录”状态下发的，拦了就会留下脏事务。
+    let need: Option<Priv> = match stmt {
+        Statement::Login { .. }
+        | Statement::Begin | Statement::Commit | Statement::Rollback => return Ok(()),
+        Statement::Select { .. } => Some(Priv::Select),
+        Statement::Insert { .. } => Some(Priv::Insert),
+        Statement::Update { .. } => Some(Priv::Update),
+        Statement::Delete { .. } => Some(Priv::Delete),
+        // DDL / DCL：不存在“表级权限”，只有 admin 能做
+        Statement::CreateTable { .. } | Statement::DropTable { .. }
+        | Statement::CreateUser { .. } | Statement::Grant { .. } | Statement::Revoke { .. } => None,
+    };
+
+    // ② 这条语句碰到的表（内部表保护要用）
+    let touched: Option<&str> = match stmt {
+        Statement::Select { table, .. } | Statement::Insert { table, .. }
+        | Statement::Update { table, .. } | Statement::Delete { table, .. }
+        | Statement::Grant { table, .. } | Statement::Revoke { table, .. } => Some(table),
+        Statement::CreateTable { name, .. } => Some(name),
+        Statement::DropTable { name } => Some(name),
+        Statement::CreateUser { .. } | Statement::Login { .. }
+        | Statement::Begin | Statement::Commit | Statement::Rollback => None,
+    };
+
+    // ③ bootstrap：库里一个用户都没有 → 不设防。
+    //    否则第一个 CREATE USER 永远发不出去（死锁：要建用户必须先有用户）。
+    if user_count(db)? == 0 {
+        return Ok(());
+    }
+
+    // ④ 一旦有了用户，匿名就没有任何权限
+    let user = match &session.user {
+        Some(u) => u,
+        None => return Err("please LOGIN first".into()),
+    };
+
+    let admin = is_admin(db, user)?;
+
+    // ⑤ 内部表保护：admin 可以 SELECT（验收/运维要看），但谁都不能直接写。
+    //    能写就等于可以手工插一条伪造的 pwd_hash，或删掉最后一个 admin ——
+    //    内部表只能由 DCL 代码维护。
+    if let Some(t) = touched {
+        if t.starts_with(INTERNAL_PREFIX) {
+            if admin && need == Some(Priv::Select) {
+                return Ok(());
+            }
+            return Err(format!("cannot access internal table '{}' directly", t));
+        }
+    }
+
+    // ⑥ admin 全权
+    if admin {
+        return Ok(());
+    }
+
+    // ⑦ 表级 ACL
+    match (touched, need) {
+        (Some(t), Some(p)) => {
+            if has_priv(db, user, t, p)? {
+                Ok(())
+            } else {
+                // 不区分“表不存在”和“没权限”：否则外部能靠报错文案探测库结构
+                Err(format!("permission denied: {} on table '{}'", priv_name(p), t))
+            }
+        }
+        // DDL/DCL 且不是 admin
+        (_, None) => Err("permission denied: admin required".to_string()),
+        // 兜底也是 Err：宁可误拒，不可误放
+        (None, Some(_)) => Err("permission denied".to_string()),
+    }
+}
 pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Result<ResultSet, String> {
+    authorize(&stmt, db, session)?;
     match stmt {
         Statement::CreateTable { name, columns } => {
             execute_create_table(name, columns, db)
@@ -191,6 +579,10 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
             Ok(ResultSet::Ok)
         }
         Statement::Update { table, assignments, filter } => execute_update(table, assignments, filter, db, session),
+        Statement::CreateUser { name, password } => execute_create_user(name, password, db, session),
+        Statement::Login { name, password } => execute_login(name, password, db, session),
+        Statement::Grant { privs, table, user } => execute_grant(privs, table, user, db, session),
+        Statement::Revoke { privs, table, user } => execute_revoke(privs, table, user, db, session),
     }
 }
 
@@ -2233,6 +2625,148 @@ mod tests {
             other => panic!("got {:?}", other),
         }
 
+        let _ = db.shutdown();
+    }
+    /// 断言某条 SQL 必须失败，且错误信息包含指定片段。
+    /// 直接比较整串太脆（改一个字就红），只比关键片段。
+    fn assert_err_contains(res: Result<ResultSet, String>, needle: &str) {
+        match res {
+            Ok(other) => panic!("expected error containing '{}', got {:?}", needle, other),
+            Err(e) => assert!(e.contains(needle), "expected '{}', got: {}", needle, e),
+        }
+    }
+
+    #[test]
+    fn test_e2e_access_control() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        // ① 零用户：bootstrap 不设防
+        exec_sql(&mut db, &mut session, "CREATE TABLE acl_t (id INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO acl_t VALUES (1)").unwrap();
+
+        // ② 第一个用户自动成为 admin
+        exec_sql(&mut db, &mut session, "CREATE USER alice PASSWORD 'pw123'").unwrap();
+
+        // ③ 建用户 ≠ 登录：同一条连接仍然是匿名
+        assert_err_contains(
+            exec_sql(&mut db, &mut session, "SELECT * FROM acl_t"),
+            "please LOGIN first",
+        );
+
+        // ④ 登录后 admin 全权
+        exec_sql(&mut db, &mut session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        assert!(matches!(
+            exec_sql(&mut db, &mut session, "SELECT * FROM acl_t").unwrap(),
+            ResultSet::Rows { .. }
+        ));
+
+        // ⑤ 第二个用户是普通用户
+        exec_sql(&mut db, &mut session, "CREATE USER bob PASSWORD 'pw456'").unwrap();
+        exec_sql(&mut db, &mut session, "LOGIN bob PASSWORD 'pw456'").unwrap();
+
+        // ⑥ 没授权 → 四种 DML 全拒
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT * FROM acl_t"),
+                            "permission denied: SELECT");
+        assert_err_contains(exec_sql(&mut db, &mut session, "INSERT INTO acl_t VALUES (2)"),
+                            "permission denied: INSERT");
+        assert_err_contains(exec_sql(&mut db, &mut session, "UPDATE acl_t SET id = 9 WHERE id = 1"),
+                            "permission denied: UPDATE");
+        assert_err_contains(exec_sql(&mut db, &mut session, "DELETE FROM acl_t WHERE id = 1"),
+                            "permission denied: DELETE");
+
+        // ⑦ DDL 只有 admin 能做（报的是 admin required，不是表级权限）
+        assert_err_contains(exec_sql(&mut db, &mut session, "CREATE TABLE acl_x (id INT)"),
+                            "admin required");
+
+        // ⑧ 内部表：普通用户连读都不行
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT * FROM __minidb_users"),
+                            "cannot access internal table");
+
+        // ⑨ admin 授权；重复 GRANT 幂等（第二次 0 行）
+        exec_sql(&mut db, &mut session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        assert!(matches!(
+            exec_sql(&mut db, &mut session, "GRANT SELECT, INSERT ON acl_t TO bob").unwrap(),
+            ResultSet::Affected(2)
+        ));
+        assert!(matches!(
+            exec_sql(&mut db, &mut session, "GRANT SELECT, INSERT ON acl_t TO bob").unwrap(),
+            ResultSet::Affected(0)
+        ));
+
+        // ⑩ 授权立刻生效；没授的权限仍然拒
+        exec_sql(&mut db, &mut session, "LOGIN bob PASSWORD 'pw456'").unwrap();
+        assert!(matches!(
+            exec_sql(&mut db, &mut session, "SELECT * FROM acl_t").unwrap(),
+            ResultSet::Rows { .. }
+        ));
+        assert!(matches!(
+            exec_sql(&mut db, &mut session, "INSERT INTO acl_t VALUES (2)").unwrap(),
+            ResultSet::Affected(1)
+        ));
+        assert_err_contains(exec_sql(&mut db, &mut session, "DELETE FROM acl_t WHERE id = 2"),
+                            "permission denied: DELETE");
+
+        // ⑪ 撤权立刻生效
+        exec_sql(&mut db, &mut session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        assert!(matches!(
+            exec_sql(&mut db, &mut session, "REVOKE SELECT ON acl_t FROM bob").unwrap(),
+            ResultSet::Affected(1)
+        ));
+        exec_sql(&mut db, &mut session, "LOGIN bob PASSWORD 'pw456'").unwrap();
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT * FROM acl_t"),
+                            "permission denied: SELECT");
+
+        // ⑫ admin 也不许直接写内部表（可读不可写）
+        exec_sql(&mut db, &mut session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        assert_err_contains(
+            exec_sql(&mut db, &mut session, "DELETE FROM __minidb_users WHERE username = 'bob'"),
+            "cannot access internal table",
+        );
+
+        // ⑬ 口令错误：用户存在与不存在返回同一句话（防用户名枚举）
+        let mut anon = Session::new();
+        assert_err_contains(exec_sql(&mut db, &mut anon, "LOGIN alice PASSWORD 'wrong'"),
+                            "invalid username or password");
+
+        // ⑭ 事务中禁止切换身份
+        exec_sql(&mut db, &mut session, "BEGIN").unwrap();
+        assert_err_contains(exec_sql(&mut db, &mut session, "LOGIN bob PASSWORD 'pw456'"),
+                            "not allowed inside a transaction");
+        exec_sql(&mut db, &mut session, "ROLLBACK").unwrap();
+
+        // 清理
+        let _ = exec_sql(&mut db, &mut session, "DROP TABLE acl_t");
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_access_control_persists_after_reopen() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE acp_t (id INT)").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE USER root2 PASSWORD 'rootpw'").unwrap();
+        db.shutdown().unwrap();
+        drop(db);
+
+        // 重开同一个库：账号、口令摘要都必须从内部表恢复
+        let mut db = Database::open_at(TEST_DB, TEST_LOG).expect("reopen");
+        let mut session = Session::new();
+
+        // 重启后 bootstrap 不会重来：匿名仍然被拒
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT * FROM acp_t"),
+                            "please LOGIN first");
+
+        exec_sql(&mut db, &mut session, "LOGIN root2 PASSWORD 'rootpw'").unwrap();
+        assert!(matches!(
+            exec_sql(&mut db, &mut session, "SELECT * FROM acp_t").unwrap(),
+            ResultSet::Rows { .. }
+        ));
+
+        let _ = exec_sql(&mut db, &mut session, "DROP TABLE acp_t");
         let _ = db.shutdown();
     }
 }

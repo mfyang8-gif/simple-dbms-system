@@ -39,10 +39,15 @@ fn handle_client(stream: TcpStream, db: Arc<Mutex<Database>>) -> std::io::Result
         .unwrap_or_else(|_| "?".to_string());
     println!("[+] client connected: {}", peer);
 
+    // 必须在 stream 被 move 进 BufReader 之前取地址
+    let is_local = stream.peer_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false);
+
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
     let mut session = Session::new();
-
+    session.peer_is_local = is_local;
     for line in reader.lines() {
         let line = line?;
         let sql = line.trim();

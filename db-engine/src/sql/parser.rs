@@ -31,10 +31,13 @@ impl Parser {
             Token::Insert  => self.parse_insert(),
             Token::Update  => self.parse_update(),
             Token::Delete  => self.parse_delete(),
-            Token::Create  => self.parse_create_table(),
+            Token::Create  => self.parse_create(),
             Token::Drop    => self.parse_drop_table(),
             Token::Begin   => { self.advance(); Ok(Statement::Begin) }
             Token::Commit  => { self.advance(); Ok(Statement::Commit) }
+            Token::Grant   => self.parse_grant(),    // ← 新增
+            Token::Revoke  => self.parse_revoke(),   // ← 新增
+            Token::Login   => self.parse_login(),    // ← 新增
             Token::Rollback => { self.advance(); Ok(Statement::Rollback) }
             tok => Err(format!("expected statement keyword, got {:?}", tok)),
         }
@@ -65,6 +68,41 @@ impl Parser {
         match self.advance() {
             Token::Ident(s) => Ok(s),
             tok => Err(format!("expected identifier, got {:?}", tok)),
+        }
+    }
+
+    fn parse_grant(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Grant)?;              // dispatch 只 peek 没吃，这里补上
+        let privs = self.parse_priv_list()?;      // 权限列表
+        self.expect(&Token::On)?;
+        let table = self.expect_ident()?;
+        self.expect(&Token::To)?;
+        let user = self.expect_ident()?;
+        Ok(Statement::Grant { privs, table, user })
+    }
+
+    fn parse_revoke(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Revoke)?;
+        let privs = self.parse_priv_list()?;
+        self.expect(&Token::On)?;
+        let table = self.expect_ident()?;
+        self.expect(&Token::From)?;
+        let user = self.expect_ident()?;
+        Ok(Statement::Revoke { privs, table, user })
+    }
+
+    fn parse_create_user(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Create)?;
+        self.expect(&Token::User)?;
+        let name = self.expect_ident()?;         // alice → Token::Ident
+        self.expect(&Token::Password)?;
+        let password = self.expect_password()?;  // 's3cret' → Token::Str
+        Ok(Statement::CreateUser { name, password })
+    }
+    fn expect_password(&mut self) -> Result<String, String> {
+        match self.advance() {
+            Token::Str(s) => Ok(s),
+            tok => Err(format!("expected password string literal, got {:?}", tok)),
         }
     }
 
@@ -280,7 +318,17 @@ impl Parser {
         let filter = self.parse_where()?;
         Ok(Statement::Delete { table, filter })
     }
+    fn parse_create(&mut self) -> Result<Statement, String> {
+        if self.peek_at(1) == &Token::User {
+            return self.parse_create_user();
+        }
+        self.parse_create_table()      // 它自己会 expect(Create)
+    }
 
+    /// 往前看 offset 格，不消费
+    fn peek_at(&self, offset: usize) -> &Token {
+        self.tokens.get(self.pos + offset).unwrap_or(&Token::Eof)
+    }
     fn parse_create_table(&mut self) -> Result<Statement, String> {
         self.expect(&Token::Create)?;
         self.expect(&Token::Table)?;
@@ -355,7 +403,35 @@ impl Parser {
         Ok(Statement::DropTable { name })
 
     }
+    /// 读一个权限关键字 → Priv。
+    /// 注意这里 match 的是 Token，不是字符串：lexer 已经把 SELECT 升格成 Token::Select 了。
+    fn parse_one_priv(&mut self) -> Result<Priv, String> {
+        match self.advance() {
+            Token::Select => Ok(Priv::Select),
+            Token::Insert => Ok(Priv::Insert),
+            Token::Update => Ok(Priv::Update),
+            Token::Delete => Ok(Priv::Delete),
+            tok => Err(format!(
+                "expected privilege (SELECT/INSERT/UPDATE/DELETE), got {:?}", tok)),
+        }
+    }
 
+    /// 权限列表。ALL 是语法糖，在这里就地展开成四项 —— 执行层永远见不到 "ALL"。
+    fn parse_priv_list(&mut self) -> Result<Vec<Priv>, String> {
+        // ALL 单独前置判断，不塞进循环：它后面不允许跟逗号
+        if self.peek() == &Token::All {
+            self.advance();
+            return Ok(vec![Priv::Select, Priv::Insert, Priv::Update, Priv::Delete]);
+        }
+
+        let mut out = Vec::new();
+        loop {
+            out.push(self.parse_one_priv()?);       // 先读一个权限（会消费）
+            if self.peek() != &Token::Comma { break; }  // 再回头看逗号（不消费）
+            self.advance();                          // 是逗号才吃掉，继续
+        }
+        Ok(out)
+    }
     // ===== 辅助：解析 SELECT 列表 =====
     fn parse_select_items(&mut self) -> Result<Vec<SelectItem>, String> {
         // 如果是 Star → [SelectItem::Star]
@@ -556,6 +632,13 @@ impl Parser {
         };
         self.expect(&Token::RParen)?;
         Ok(Expr::Aggregate { func, column })
+    }
+    fn parse_login(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Login)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::Password)?;        // ← 你漏的就是这行
+        let password = self.expect_password()?;
+        Ok(Statement::Login { name, password })
     }
 }
 
@@ -990,5 +1073,47 @@ mod tests {
             Statement::Select { distinct, .. } => assert!(!distinct),
             other => panic!("got {:?}", other),
         }
+    }
+    #[test]
+    fn test_access_control_parses() {
+        // ① 单个权限
+        match parse_sql("GRANT SELECT ON users TO alice").unwrap() {
+            Statement::Grant { privs, table, user } => {
+                assert_eq!(privs, vec![Priv::Select]);
+                assert_eq!(table, "users");
+                assert_eq!(user, "alice");
+            }
+            other => panic!("expected Grant, got {:?}", other),
+        }
+
+        // ② 多个权限 + 顺序
+        match parse_sql("GRANT SELECT, INSERT ON users TO alice").unwrap() {
+            Statement::Grant { privs, .. } => assert_eq!(privs, vec![Priv::Select, Priv::Insert]),
+            other => panic!("expected Grant, got {:?}", other),
+        }
+
+        // ③ ALL 在语法层展开成 4 项
+        match parse_sql("GRANT ALL ON users TO alice").unwrap() {
+            Statement::Grant { privs, .. } => assert_eq!(
+                privs,
+                vec![Priv::Select, Priv::Insert, Priv::Update, Priv::Delete]
+            ),
+            other => panic!("expected Grant, got {:?}", other),
+        }
+
+        // ④ REVOKE 用的是 FROM
+        assert!(matches!(
+        parse_sql("REVOKE SELECT ON users FROM alice").unwrap(),
+        Statement::Revoke { .. }
+    ));
+
+        // ⑤ CREATE USER：用户名是 Ident、口令是 Str —— 这条就是抓你刚才那个 bug 的
+        assert_eq!(
+            parse_sql("CREATE USER alice PASSWORD 's3cret'").unwrap(),
+            Statement::CreateUser { name: "alice".into(), password: "s3cret".into() }
+        );
+
+        // ⑥ 口令不加引号 → 语法层拒绝（Q7 的落地）
+        assert!(parse_sql("CREATE USER bob PASSWORD 123").is_err());
     }
 }

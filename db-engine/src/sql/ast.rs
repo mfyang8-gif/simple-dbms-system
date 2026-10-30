@@ -51,6 +51,10 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    CreateUser { name: String, password: String },
+    Login { name: String, password: String },
+    Grant { privs: Vec<Priv>, table: String, user: String },
+    Revoke { privs: Vec<Priv>, table: String, user: String },
 }
 
 /// SELECT 列表里的每一项
@@ -135,4 +139,14 @@ pub enum LitValue {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BinOp {
     Eq, Neq, Lt, Le, Gt, Ge,
+}
+
+/// 表级权限。四个变体都是"无数据"的，所以可以 Copy。
+/// Eq 是 PartialEq 的加强版：声明"相等"满足自反/对称/传递，放进 HashSet 需要它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priv {
+    Select,
+    Insert,
+    Update,
+    Delete,
 }

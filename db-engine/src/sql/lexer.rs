@@ -137,6 +137,13 @@ impl Lexer {
                     "AVG" => Ok(Token::Avg),
                     "MIN" => Ok(Token::Min),
                     "MAX" => Ok(Token::Max),
+                    "USER" => Ok(Token::User),
+                    "PASSWORD" => Ok(Token::Password),
+                    "LOGIN" => Ok(Token::Login),
+                    "GRANT" => Ok(Token::Grant),
+                    "REVOKE" => Ok(Token::Revoke),
+                    "TO" => Ok(Token::To),
+                    "ALL" => Ok(Token::All),
                     _ => Ok(Token::Ident(s)),
                 }
 

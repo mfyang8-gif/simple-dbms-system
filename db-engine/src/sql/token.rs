@@ -18,6 +18,8 @@ pub enum Token {
     Unique, Default,
     // 聚合函数
     Sum, Count, Avg, Min, Max,
+    // 访问控制（DCL）
+    User, Password, Login, Grant, Revoke, To, All,
 
     // ===== 标识符与字面量 =====
     Ident(String),       // 表名、列名等用户自定义名
