@@ -29,6 +29,8 @@ pub struct Session {
     /// REPL 与单元测试没有网络对端，构造时默认 true；
     /// 网络连接在 server/mod.rs 里用真实 peer 地址显式覆盖。
     pub peer_is_local: bool,
+    /// 当前库名；None = 启动时打开的默认库
+    pub current_db: Option<String>,
 }
 
 fn ast_col_to_column(def: ColumnDef) -> Column {
@@ -153,7 +155,7 @@ fn execute_create_table(name: String, columns: Vec<ColumnDef>, db: &mut Database
 
 impl Session {
     pub fn new() -> Self {
-        Self { txn_id: None, user: None, peer_is_local: true }
+        Self { txn_id: None, user: None, peer_is_local: true, current_db: None }
     }
 }
 // ==================== 访问控制：内部表 ====================
@@ -177,24 +179,22 @@ fn hash_password(plain: &str) -> String {
     format!("{:016x}", hash)
 }
 
-/// 幂等：两张表不在就建。每条 DCL 语句进来前调一次。
-/// 内部表由 catalog.create_table 创建，它内部会 flush（走 WAL），所以天然崩溃安全。
-fn ensure_internal_tables(db: &mut Database) -> Result<(), String> {
+/// 只建账号表（建在「账号库」上）
+fn ensure_users_table(db: &mut Database) -> Result<(), String> {
     if db.get_table_meta(USERS_TABLE).is_none() {
         db.create_table(USERS_TABLE, vec![
-            // 用户名当主键：唯一列判定是逐列独立的，单列做主键才拦得住重名
             Column::varchar("username", 64).primary_key(),
-            // 定 64 不是 16：将来换 bcrypt(60 字符) 不用改表结构
             Column::varchar("pwd_hash", 64).not_null(),
             Column::int("is_admin").not_null(),
         ]).map_err(|e| format!("create {}: {}", USERS_TABLE, e))?;
     }
+    Ok(())
+}
 
+/// 只建权限表（建在「当前库」上）
+fn ensure_privs_table(db: &mut Database) -> Result<(), String> {
     if db.get_table_meta(PRIVS_TABLE).is_none() {
         db.create_table(PRIVS_TABLE, vec![
-            // grant_key = "user|table|PRIV"，用单列字符串拼出复合主键。
-            // 不能建三列复合主键：本引擎的唯一约束是「逐列独立判定」，
-            // 多列放在一起不构成复合键。
             Column::varchar("grant_key", 200).primary_key(),
             Column::varchar("username", 64).not_null(),
             Column::varchar("table_name", 64).not_null(),
@@ -210,12 +210,12 @@ fn ensure_internal_tables(db: &mut Database) -> Result<(), String> {
 fn execute_create_user(
     name: String,
     password: String,
-    db: &mut Database,
+    accounts: &mut Database,     // ← 原 db
     session: &mut Session,
 ) -> Result<ResultSet, String> {
-    ensure_internal_tables(db)?;
+    ensure_users_table(accounts)?;   // ← 原 ensure_internal_tables(db)
 
-    let mut users = db
+    let mut users = accounts
         .open_table(USERS_TABLE)
         .map_err(|e| format!("open {}: {}", USERS_TABLE, e))?;
 
@@ -235,7 +235,7 @@ fn execute_create_user(
 
     // 加入当前事务：BEGIN; CREATE USER ...; ROLLBACK 时这个用户会一起消失。
     // 这是与表数据一致的事务语义，属于可接受边界（要写进报告）。
-    db.insert_in_txn(&mut users, row, session.txn_id)
+    accounts.insert_in_txn(&mut users, row, session.txn_id)
         .map_err(|e| format!("create user failed: {}", e))?;
 
     // 非第一个用户的 admin 校验不在这里做：4-E 的 authorize 统一拦，
@@ -246,7 +246,7 @@ fn execute_create_user(
 fn execute_login(
     name: String,
     password: String,
-    db: &mut Database,
+    accounts: &Database,          // ← 原 db，去掉 mut
     session: &mut Session,
 ) -> Result<ResultSet, String> {
     // 事务中禁止切身份：否则同一事务前半段是 A 的权限、后半段是 B 的，
@@ -257,11 +257,11 @@ fn execute_login(
 
     // LOGIN 是只读操作：零用户时不调 ensure_internal_tables
     // （否则“登录失败”会顺手在库里建出两张表，纯副作用）。
-    if db.get_table_meta(USERS_TABLE).is_none() {
+    if accounts.get_table_meta(USERS_TABLE).is_none() {
         return Err("invalid username or password".into());
     }
 
-    let users = db
+    let users = accounts
         .open_table(USERS_TABLE)
         .map_err(|e| format!("open {}: {}", USERS_TABLE, e))?;
 
@@ -322,10 +322,10 @@ fn execute_grant(
     table: String,
     user: String,
     db: &mut Database,
+    accounts: Option<&Database>,   // ← 新增
     session: &mut Session,
 ) -> Result<ResultSet, String> {
-    // GRANT 是写操作，两张内部表必须存在
-    ensure_internal_tables(db)?;
+    ensure_privs_table(db)?;       // ← 原 ensure_internal_tables(db)
 
     // ① 表必须真实存在。否则会留下一条「幽灵权限」：
     //    今天给不存在的 del_log 授权，明年有人建了 del_log，权限突然生效。
@@ -335,10 +335,14 @@ fn execute_grant(
 
     // ② 用户必须真实存在。否则就是「给未来的同名用户预埋权限」，
     //    本质上是后门：攻击者先 GRANT，再等你建出这个用户。
-    if !user_exists(db, &user)? {
+    // 用户存在性去账号库查；None 表示账号库就是当前库
+    let user_ok = match accounts {
+        Some(a) => user_exists(a, &user)?,
+        None => user_exists(db, &user)?,
+    };
+    if !user_ok {
         return Err(format!("user '{}' does not exist", user));
     }
-
     let mut privs_tbl = db
         .open_table(PRIVS_TABLE)
         .map_err(|e| format!("open {}: {}", PRIVS_TABLE, e))?;
@@ -417,6 +421,63 @@ fn execute_revoke(
     }
     Ok(ResultSet::Affected(removed))
 }
+// ==================== 多库：CREATE DATABASE / USE ====================
+
+/// 从当前库的路径推出「同目录下的另一个库」的两个文件路径。
+/// 不硬编码 "./data"：open_at 允许任意目录，库文件必须跟着当前库走。
+fn sibling_paths(db: &Database, name: &str) -> Result<(String, String), String> {
+    let dir = std::path::Path::new(db.db_path())
+        .parent()
+        .ok_or("cannot determine database directory")?;
+    let db_file = dir.join(format!("{}.db", name));
+    let log_file = dir.join(format!("{}.log", name));
+    let db_file = db_file.to_str().ok_or("invalid database path")?;
+    let log_file = log_file.to_str().ok_or("invalid database path")?;
+    Ok((db_file.to_string(), log_file.to_string()))
+}
+
+fn execute_create_database(name: String, db: &Database) -> Result<ResultSet, String> {
+    // ① 保留前缀：内部表用 __minidb_，库名不能占这个命名空间
+    if name.starts_with(INTERNAL_PREFIX) {
+        return Err(format!("database name '{}' is reserved", name));
+    }
+    // ② 不依赖上游：lexer 的标识符规则已经挡住了 '/' '\' '.'，
+    //    但这里是「文件路径的最后一道关」，必须自己验一遍
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Err(format!("invalid database name '{}'", name));
+    }
+
+    let (db_file, log_file) = sibling_paths(db, &name)?;
+
+    // ③ 已存在：用文件存在性判断，绝不能用 open_at 试探
+    //    （open_at 是「打开或创建」，试探等于顺手把库建出来）
+    if std::path::Path::new(&db_file).exists() {
+        return Err(format!("database '{}' already exists", name));
+    }
+
+    // ④ 建库 = 初始化一个新文件。open_at 内部会 init_new 并 flush 系统页
+    let mut new_db = Database::open_at(&db_file, &log_file)
+        .map_err(|e| format!("create database '{}': {}", name, e))?;
+    new_db.shutdown()
+        .map_err(|e| format!("close new database '{}': {}", name, e))?;
+
+    Ok(ResultSet::Ok)
+}
+
+fn execute_use(name: String, db: &Database, session: &mut Session) -> Result<ResultSet, String> {
+    if session.txn_id.is_some() {
+        return Err("USE is not allowed inside a transaction".into());
+    }
+    let (db_file, _log_file) = sibling_paths(db, &name)?;
+
+    // 用存在性判断，不是 open_at：后者会把不存在的库创建出来
+    if !std::path::Path::new(&db_file).exists() {
+        return Err(format!("database '{}' does not exist", name));
+    }
+
+    session.current_db = Some(name);
+    Ok(ResultSet::Ok)
+}
 // ==================== 访问控制：唯一闸门 ====================
 
 fn user_count(db: &Database) -> Result<usize, String> {
@@ -443,6 +504,7 @@ fn is_admin(db: &Database, user: &str) -> Result<bool, String> {
     Ok(false)
 }
 
+// 检查某用户对某表是否有某权限
 fn has_priv(db: &Database, user: &str, table: &str, p: Priv) -> Result<bool, String> {
     if db.get_table_meta(PRIVS_TABLE).is_none() {
         return Ok(false);
@@ -460,12 +522,22 @@ fn has_priv(db: &Database, user: &str, table: &str, p: Priv) -> Result<bool, Str
     Ok(false)
 }
 
-fn authorize(stmt: &Statement, db: &Database, session: &Session) -> Result<(), String> {
+/// `db` = 语句要操作的库；`accounts` = 实例级账号库（None 表示就是 db 自己）
+fn authorize(
+    stmt: &Statement,
+    db: &Database,
+    accounts: Option<&Database>,
+    session: &Session,
+) -> Result<(), String> {
+    // 账号相关的查询统一走这里：有独立系统库就读它，否则读当前库
+    let acc: &Database = accounts.unwrap_or(db);
     // ① 事务控制与 LOGIN 本身一律放行。
     //    BEGIN/COMMIT/ROLLBACK 必须放行：连接断开时 server 会自动发一条 ROLLBACK
     //    （server/mod.rs:74-78），那是在“未登录”状态下发的，拦了就会留下脏事务。
     let need: Option<Priv> = match stmt {
         Statement::Login { .. }
+        // USE 只改会话状态，不读写任何页，也不涉及表和权限
+        | Statement::Use { .. }
         | Statement::Begin | Statement::Commit | Statement::Rollback => return Ok(()),
         Statement::Select { .. } => Some(Priv::Select),
         Statement::Insert { .. } => Some(Priv::Insert),
@@ -473,7 +545,11 @@ fn authorize(stmt: &Statement, db: &Database, session: &Session) -> Result<(), S
         Statement::Delete { .. } => Some(Priv::Delete),
         // DDL / DCL：不存在“表级权限”，只有 admin 能做
         Statement::CreateTable { .. } | Statement::DropTable { .. }
-        | Statement::CreateUser { .. } | Statement::Grant { .. } | Statement::Revoke { .. } => None,
+        | Statement::CreateUser { .. } | Statement::Grant { .. } | Statement::Revoke { .. }
+        // 建库不是“对某张表的权限”，只有 admin 能做（靠 ⑦ 的 (_, None) 分支）
+        | Statement::CreateDatabase { .. } => None,
+
+
     };
 
     // ② 这条语句碰到的表（内部表保护要用）
@@ -484,14 +560,16 @@ fn authorize(stmt: &Statement, db: &Database, session: &Session) -> Result<(), S
         Statement::CreateTable { name, .. } => Some(name),
         Statement::DropTable { name } => Some(name),
         Statement::CreateUser { .. } | Statement::Login { .. }
-        | Statement::Begin | Statement::Commit | Statement::Rollback => None,
+        | Statement::Begin | Statement::Commit | Statement::Rollback
+        // 库名不是表名，不能塞进 touched（否则会误触内部表前缀检查）
+        | Statement::CreateDatabase { .. } | Statement::Use { .. } => None,
     };
 
     // ③ bootstrap：库里一个用户都没有 → 只有本地连接可以不设防。
     //    这是 MongoDB「localhost exception」的同构做法：不试图消灭窗口
     //    （只要初始管理员由网络请求触发，先到者必然得手），
     //    而是把窗口的可达范围从 0.0.0.0 收敛到 127.0.0.1。
-    if user_count(db)? == 0 {
+    if user_count(acc)? == 0 {
         if session.peer_is_local {
             return Ok(());
         }
@@ -504,7 +582,7 @@ fn authorize(stmt: &Statement, db: &Database, session: &Session) -> Result<(), S
         None => return Err("please LOGIN first".into()),
     };
 
-    let admin = is_admin(db, user)?;
+    let admin = is_admin(acc, user)?;
 
     // ⑤ 内部表保护：admin 可以 SELECT（验收/运维要看），但谁都不能直接写。
     //    能写就等于可以手工插一条伪造的 pwd_hash，或删掉最后一个 admin ——
@@ -539,8 +617,14 @@ fn authorize(stmt: &Statement, db: &Database, session: &Session) -> Result<(), S
         (None, Some(_)) => Err("permission denied".to_string()),
     }
 }
-pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Result<ResultSet, String> {
-    authorize(&stmt, db, session)?;
+pub fn execute(
+    stmt: Statement,
+    db: &mut Database,
+    accounts: Option<&mut Database>,
+    session: &mut Session,
+) -> Result<ResultSet, String> {
+    // 这里把 &mut 降级成 & 送进 authorize：两个不可变借用可以共存
+    authorize(&stmt, db, accounts.as_deref(), session)?;
     match stmt {
         Statement::CreateTable { name, columns } => {
             execute_create_table(name, columns, db)
@@ -584,10 +668,20 @@ pub fn execute(stmt: Statement, db: &mut Database, session: &mut Session) -> Res
             Ok(ResultSet::Ok)
         }
         Statement::Update { table, assignments, filter } => execute_update(table, assignments, filter, db, session),
-        Statement::CreateUser { name, password } => execute_create_user(name, password, db, session),
-        Statement::Login { name, password } => execute_login(name, password, db, session),
-        Statement::Grant { privs, table, user } => execute_grant(privs, table, user, db, session),
+        Statement::CreateUser { name, password } => {
+            // accounts 为 None 时，账号库就是当前库
+            let acc = accounts.unwrap_or(db);
+            execute_create_user(name, password, acc, session)
+        }
+        Statement::Login { name, password } => {
+            execute_login(name, password, accounts.as_deref().unwrap_or(db), session)
+        }
+        Statement::Grant { privs, table, user } => {
+            execute_grant(privs, table, user, db, accounts.as_deref(), session)
+        }
         Statement::Revoke { privs, table, user } => execute_revoke(privs, table, user, db, session),
+        Statement::CreateDatabase { name } => execute_create_database(name, db),
+        Statement::Use { name } => execute_use(name, db, session),
     }
 }
 
@@ -1497,7 +1591,7 @@ mod tests {
     fn exec_sql(db: &mut Database, session: &mut Session, sql: &str) -> Result<ResultSet, String> {
         let tokens = Lexer::new(sql).tokenize()?;
         let stmt = Parser::new(tokens).parse()?;
-        execute(stmt, db, session)
+        execute(stmt, db, None, session)
     }
 
     /// 所有 e2e 测试共用 ./data/db.db，并行跑会互相删文件（Invalid magic: got 0x00000000）。
@@ -2798,5 +2892,162 @@ mod tests {
                             "please LOGIN first");
 
         let _ = db.shutdown();
+    }
+
+    // ==================== 多库端到端 ====================
+
+    const MULTI_DIR: &str = "./data/test_multi";
+    const MULTI_DB: &str = "./data/test_multi/main.db";
+    const MULTI_LOG: &str = "./data/test_multi/main.log";
+    const SHOP_DB: &str = "./data/test_multi/shop.db";
+    const SHOP_LOG: &str = "./data/test_multi/shop.log";
+
+    /// 显式传入账号库的版本：模拟 server 层 DbRegistry::resolve 解出的 (当前库, 账号库)。
+    /// 两个库必须是不同对象——同一个对象无法同时给出两个 &mut。
+    fn exec_sql_with(
+        db: &mut Database,
+        accounts: &mut Database,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ResultSet, String> {
+        let tokens = Lexer::new(sql).tokenize()?;
+        let stmt = Parser::new(tokens).parse()?;
+        execute(stmt, db, Some(accounts), session)
+    }
+
+    #[test]
+    fn test_e2e_multi_database() {
+        let _guard = db_lock();
+        // 整个目录一起清：只删 main.db 的话，残留的 shop.db 会让「建库成功」变成假绿
+        let _ = std::fs::remove_dir_all(MULTI_DIR);
+
+        let mut main_db = Database::open_at(MULTI_DB, MULTI_LOG).expect("open main");
+        let mut session = Session::new();
+
+        // ① 默认库同时是账号库：bootstrap + admin
+        exec_sql(&mut main_db, &mut session, "CREATE USER alice PASSWORD 'pw123'").unwrap();
+        exec_sql(&mut main_db, &mut session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+
+        // ② 库名规则：内部前缀保留
+        assert_err_contains(
+            exec_sql(&mut main_db, &mut session, "CREATE DATABASE __minidb_x"),
+            "reserved",
+        );
+
+        // ③ 建库 = 建两个文件；重复建库被拒
+        exec_sql(&mut main_db, &mut session, "CREATE DATABASE shop").unwrap();
+        assert!(std::path::Path::new(SHOP_DB).exists(), "shop.db 应该被创建");
+        assert!(std::path::Path::new(SHOP_LOG).exists(), "shop.log 应该被创建");
+        assert_err_contains(
+            exec_sql(&mut main_db, &mut session, "CREATE DATABASE shop"),
+            "already exists",
+        );
+
+        // ④ USE 只认已存在的库，而且不会顺手把库建出来
+        exec_sql(&mut main_db, &mut session, "USE shop").unwrap();
+        assert_err_contains(
+            exec_sql(&mut main_db, &mut session, "USE nosuch"),
+            "does not exist",
+        );
+        assert!(!std::path::Path::new("./data/test_multi/nosuch.db").exists());
+        session.current_db = None;   // execute() 不消费它，清掉避免干扰后文
+
+        // ⑤ 事务中禁止切库（事务号在各库的 txn_mgr 里不通用）
+        exec_sql(&mut main_db, &mut session, "BEGIN").unwrap();
+        assert_err_contains(
+            exec_sql(&mut main_db, &mut session, "USE shop"),
+            "not allowed inside a transaction",
+        );
+        exec_sql(&mut main_db, &mut session, "ROLLBACK").unwrap();
+
+        // ===== 以下模拟 server 层：当前库 = shop，账号库 = main =====
+        let mut shop = Database::open_at(SHOP_DB, SHOP_LOG).expect("open shop");
+        let mut shop_session = Session::new();
+        shop_session.current_db = Some("shop".to_string());
+
+        // ⑥ 账号表只有一份（在主库）：shop 里匿名照样被拒
+        assert_err_contains(
+            exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "SELECT * FROM t"),
+            "please LOGIN first",
+        );
+
+        // ⑦ 主库的 admin 登录后能在 shop 建表 —— 身份是实例级的
+        exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "CREATE TABLE t (id INT)").unwrap();
+        exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "INSERT INTO t VALUES (7)").unwrap();
+
+        // ⑧ 库间隔离：主库里没有 t
+        assert_err_contains(
+            exec_sql(&mut main_db, &mut session, "SELECT * FROM t"),
+            "not found",
+        );
+
+        // ⑨ 在 shop 里建的用户，落在主库的 __minidb_users
+        exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "CREATE USER bob PASSWORD 'pw456'").unwrap();
+        match exec_sql(&mut main_db, &mut session, "SELECT username FROM __minidb_users").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 2, "alice + bob"),
+            other => panic!("got {:?}", other),
+        }
+
+        // ⑩ 普通用户在 shop 里没授权 → 拒
+        exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "LOGIN bob PASSWORD 'pw456'").unwrap();
+        assert_err_contains(
+            exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "SELECT * FROM t"),
+            "permission denied: SELECT",
+        );
+
+        // ⑪ 在 shop 里授权 → 只对 shop 生效
+        exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        assert!(matches!(
+            exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "GRANT SELECT ON t TO bob").unwrap(),
+            ResultSet::Affected(1)
+        ));
+        exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "LOGIN bob PASSWORD 'pw456'").unwrap();
+        assert!(matches!(
+            exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "SELECT * FROM t").unwrap(),
+            ResultSet::Rows { .. }
+        ));
+
+        // ⑫ 权限不跨库：主库有同名表 t，但 bob 的授权记录只存在于 shop 的 __minidb_privs
+        exec_sql(&mut main_db, &mut session, "CREATE TABLE t (id INT)").unwrap();
+        exec_sql(&mut main_db, &mut session, "INSERT INTO t VALUES (9)").unwrap();
+        let mut main_bob = Session::new();
+        exec_sql(&mut main_db, &mut main_bob, "LOGIN bob PASSWORD 'pw456'").unwrap();
+        assert_err_contains(
+            exec_sql(&mut main_db, &mut main_bob, "SELECT * FROM t"),
+            "permission denied: SELECT",
+        );
+
+        // ⑬ 非 admin 不能 DDL，也不能建库
+        assert_err_contains(
+            exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "CREATE TABLE u2 (id INT)"),
+            "admin required",
+        );
+        assert_err_contains(
+            exec_sql_with(&mut shop, &mut main_db, &mut shop_session, "CREATE DATABASE other"),
+            "admin required",
+        );
+        assert!(!std::path::Path::new("./data/test_multi/other.db").exists());
+
+        // ⑭ 关库重开：shop 自己的数据、自己的 privs 都还在
+        shop.shutdown().unwrap();
+        drop(shop);
+
+        let mut shop2 = Database::open_at(SHOP_DB, SHOP_LOG).expect("reopen shop");
+        let mut s2 = Session::new();
+        exec_sql_with(&mut shop2, &mut main_db, &mut s2, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        match exec_sql_with(&mut shop2, &mut main_db, &mut s2, "SELECT * FROM t").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(cell(&rows[0][0]), "7");
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = shop2.shutdown();
+        drop(shop2);
+        let _ = main_db.shutdown();
+        drop(main_db);
+        let _ = std::fs::remove_dir_all(MULTI_DIR);
     }
 }

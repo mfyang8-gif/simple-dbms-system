@@ -1,4 +1,4 @@
-use db_engine::database::Database;
+use db_engine::database::{Database, DbRegistry};
 use db_engine::server::{run_repl, run_server};
 
 fn main() -> std::io::Result<()> {
@@ -6,19 +6,20 @@ fn main() -> std::io::Result<()> {
 
     match args.next().as_deref() {
         Some("--repl") => {
-            let mut db = Database::open()?;
-            run_repl(&mut db);
-            db.shutdown()?;
+            let db = Database::open()?;
+            let mut reg = DbRegistry::new(db);
+            run_repl(&mut reg);
+            reg.shutdown();
             println!("Bye.");
             Ok(())
         }
         Some(addr) => {
             let db = Database::open()?;
-            run_server(db, addr)
+            run_server(DbRegistry::new(db), addr)
         }
         None => {
             let db = Database::open()?;
-            run_server(db, "127.0.0.1:9000")
+            run_server(DbRegistry::new(db), "127.0.0.1:9000")
         }
     }
 }

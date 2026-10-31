@@ -144,6 +144,8 @@ impl Lexer {
                     "REVOKE" => Ok(Token::Revoke),
                     "TO" => Ok(Token::To),
                     "ALL" => Ok(Token::All),
+                    "DATABASE" => Ok(Token::Database),
+                    "USE" => Ok(Token::Use),
                     _ => Ok(Token::Ident(s)),
                 }
 

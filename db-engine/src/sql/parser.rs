@@ -38,6 +38,7 @@ impl Parser {
             Token::Grant   => self.parse_grant(),    // ← 新增
             Token::Revoke  => self.parse_revoke(),   // ← 新增
             Token::Login   => self.parse_login(),    // ← 新增
+            Token::Use     => self.parse_use(),      // ← 新增
             Token::Rollback => { self.advance(); Ok(Statement::Rollback) }
             tok => Err(format!("expected statement keyword, got {:?}", tok)),
         }
@@ -322,12 +323,29 @@ impl Parser {
         if self.peek_at(1) == &Token::User {
             return self.parse_create_user();
         }
+        if self.peek_at(1) == &Token::Database {
+            return self.parse_create_database();
+        }
         self.parse_create_table()      // 它自己会 expect(Create)
     }
 
     /// 往前看 offset 格，不消费
     fn peek_at(&self, offset: usize) -> &Token {
         self.tokens.get(self.pos + offset).unwrap_or(&Token::Eof)
+    }
+    /// CREATE DATABASE shop
+    fn parse_create_database(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Create)?;
+        self.expect(&Token::Database)?;
+        let name = self.expect_ident()?;
+        Ok(Statement::CreateDatabase { name })
+    }
+
+    /// USE shop
+    fn parse_use(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Use)?;
+        let name = self.expect_ident()?;
+        Ok(Statement::Use { name })
     }
     fn parse_create_table(&mut self) -> Result<Statement, String> {
         self.expect(&Token::Create)?;

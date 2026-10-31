@@ -55,6 +55,10 @@ pub enum Statement {
     Login { name: String, password: String },
     Grant { privs: Vec<Priv>, table: String, user: String },
     Revoke { privs: Vec<Priv>, table: String, user: String },
+    /// CREATE DATABASE shop
+    CreateDatabase { name: String },
+    /// USE shop —— 切换本会话的当前库（不是全局！）
+    Use { name: String },
 }
 
 /// SELECT 列表里的每一项

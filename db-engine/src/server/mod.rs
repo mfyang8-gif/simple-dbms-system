@@ -1,26 +1,28 @@
 // src/server/mod.rs
 use std::io::{self, Write};
 
-use crate::database::Database;
+use crate::database::DbRegistry;
 use crate::sql::{run_sql, ResultSet, Session};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::io::{BufRead, BufReader};
 use std::thread;
 
+
+
 /// 启动 TCP 服务器（阻塞，永不返回）
-pub fn run_server(db: Database, addr: &str) -> std::io::Result<()> {
+pub fn run_server(reg: DbRegistry, addr: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     println!("MiniDB listening on {}", listener.local_addr()?);
 
-    let db = Arc::new(Mutex::new(db));
+    let reg = Arc::new(Mutex::new(reg));
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let db = Arc::clone(&db);
+                let reg = Arc::clone(&reg);
                 thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, db) {
+                    if let Err(e) = handle_client(stream, reg) {
                         eprintln!("client error: {}", e);
                     }
                 });
@@ -32,17 +34,12 @@ pub fn run_server(db: Database, addr: &str) -> std::io::Result<()> {
 }
 
 /// 一条连接 = 一个 Session（事务状态跟着连接走，不跨连接共享）
-fn handle_client(stream: TcpStream, db: Arc<Mutex<Database>>) -> std::io::Result<()> {
+fn handle_client(stream: TcpStream, reg: Arc<Mutex<DbRegistry>>) -> std::io::Result<()> {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "?".to_string());
     println!("[+] client connected: {}", peer);
-
-    // 必须在 stream 被 move 进 BufReader 之前取地址
-    let is_local = stream.peer_addr()
-        .map(|a| a.ip().is_loopback())
-        .unwrap_or(false);
 
     // 必须在 stream 被 move 进 BufReader 之前取对端地址
     let peer_is_local = stream.peer_addr()
@@ -53,7 +50,7 @@ fn handle_client(stream: TcpStream, db: Arc<Mutex<Database>>) -> std::io::Result
     let reader = BufReader::new(stream);
     let mut session = Session::new();
     session.peer_is_local = peer_is_local;
-    session.peer_is_local = is_local;
+
     for line in reader.lines() {
         let line = line?;
         let sql = line.trim();
@@ -69,9 +66,13 @@ fn handle_client(stream: TcpStream, db: Arc<Mutex<Database>>) -> std::io::Result
         }
         // 锁只包住"执行"，不包住 socket IO（读和写都在锁外）
         let response = {
-            let mut guard = db.lock().unwrap();
-            match run_sql(sql, &mut guard, &mut session) {
-                Ok(rs) => format_result(&rs),
+            let mut guard = reg.lock().unwrap();
+            // 按会话的 current_db 选出要操作的库；默认库同时充当账号库
+            match guard.resolve(session.current_db.as_deref()) {
+                Ok((db, accounts)) => match run_sql(sql, db, accounts, &mut session) {
+                    Ok(rs) => format_result(&rs),
+                    Err(e) => format!("ERR {}", escape_value(&e)),
+                },
                 Err(e) => format!("ERR {}", escape_value(&e)),
             }
         };
@@ -83,8 +84,11 @@ fn handle_client(stream: TcpStream, db: Arc<Mutex<Database>>) -> std::io::Result
 
     // 连接断开时，未提交事务必须回滚，否则脏数据会留给其他连接
     if session.txn_id.is_some() {
-        let mut guard = db.lock().unwrap();
-        let _ = run_sql("ROLLBACK", &mut guard, &mut session);
+        let mut guard = reg.lock().unwrap();
+        // 事务属于「当时那个库」：USE 已经禁止在事务中执行，所以 current_db 就是事务所在的库
+        if let Ok((db, accounts)) = guard.resolve(session.current_db.as_deref()) {
+            let _ = run_sql("ROLLBACK", db, accounts, &mut session);
+        }
         println!("[!] {} disconnected with open txn -> rolled back", peer);
     }
 
@@ -219,7 +223,7 @@ pub fn format_for_human(rs: &ResultSet) -> String {
 // ===================== 4.2 REPL =====================
 
 /// 本地交互式终端：读一行 SQL → 执行 → 打印
-pub fn run_repl(db: &mut Database) {
+pub fn run_repl(reg: &mut DbRegistry) {
     let mut session = Session::new();
     let stdin = io::stdin();
 
@@ -247,8 +251,11 @@ pub fn run_repl(db: &mut Database) {
             break;
         }
 
-        match run_sql(sql, db, &mut session) {
-            Ok(rs) => println!("{}", format_for_human(&rs)),
+        match reg.resolve(session.current_db.as_deref()) {
+            Ok((db, accounts)) => match run_sql(sql, db, accounts, &mut session) {
+                Ok(rs) => println!("{}", format_for_human(&rs)),
+                Err(e) => println!("ERROR: {}", e),
+            },
             Err(e) => println!("ERROR: {}", e),
         }
     }

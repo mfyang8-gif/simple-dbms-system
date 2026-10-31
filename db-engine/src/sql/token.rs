@@ -21,6 +21,8 @@ pub enum Token {
     // 访问控制（DCL）
     User, Password, Login, Grant, Revoke, To, All,
 
+    Database, Use,
+
     // ===== 标识符与字面量 =====
     Ident(String),       // 表名、列名等用户自定义名
     Number(i64),         // 整数字面量

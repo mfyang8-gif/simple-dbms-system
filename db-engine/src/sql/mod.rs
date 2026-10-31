@@ -16,9 +16,10 @@ pub use executor::{ResultSet, Session};
 pub fn run_sql(
     sql: &str,
     db: &mut Database,
+    accounts: Option<&mut Database>,
     session: &mut Session,
 ) -> Result<ResultSet, String> {
     let tokens = lexer::Lexer::new(sql).tokenize()?;
     let stmt = parser::Parser::new(tokens).parse()?;
-    executor::execute(stmt, db, session)
+    executor::execute(stmt, db, accounts, session)
 }

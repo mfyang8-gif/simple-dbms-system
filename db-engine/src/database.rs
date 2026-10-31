@@ -15,6 +15,8 @@ use crate::storage::disk_manager::DiskManager;
 use crate::storage::file_header::{FileHeader};
 use crate::storage::free_page_manager::FreePageManager;
 use crate::table::{Column, Table};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// FreePageManager 位图管理的最大页数
 const MAX_PAGES: u32 = 1024;
@@ -33,6 +35,9 @@ pub struct Database {
     txn_mgr: Arc<Mutex<TransactionManager>>,
     /// 当前实例的 WAL 文件路径（ROLLBACK 的运行时 undo 要读它）
     log_path: String,
+
+    /// 当前实例的 db 文件路径（CREATE DATABASE 按它算出新库的兄弟路径）
+    db_path: String,
 }
 
 impl Database {
@@ -55,10 +60,10 @@ impl Database {
             let mut dm = disk_manager;
             dm.preallocate(RESERVED_PAGES)?;
             let bp = Arc::new(BufferPool::new(dm, log_manager.clone()));
-            Self::init_new(bp, log_manager, log_path)
+            Self::init_new(bp, log_manager, db_path, log_path)
         } else {
             let bp = Arc::new(BufferPool::new(disk_manager, log_manager.clone()));
-            Self::load_existing(bp, log_manager, log_path)
+            Self::load_existing(bp, log_manager, db_path, log_path)
         }
     }
 
@@ -71,7 +76,7 @@ impl Database {
         table.insert_row(row, &mut self.free_mgr, &mut self.catalog, &self.txn_mgr, txn)
     }
     /// 首次创建：初始化所有系统页
-    fn init_new(buffer_pool: Arc<BufferPool>, log_manager: Arc<LogManager>, log_path: &str) -> std::io::Result<Self> {
+    fn init_new(buffer_pool: Arc<BufferPool>, log_manager: Arc<LogManager>, db_path: &str, log_path: &str) -> std::io::Result<Self> {
         let txn_mgr = Arc::new(Mutex::new(TransactionManager::new(log_manager.clone())));
 
         // Page 0: FileHeader
@@ -95,11 +100,11 @@ impl Database {
         //   若在 shutdown 之前退出，下次 open 会看到“文件非空 + magic=0”，被误判成已有库。
         buffer_pool.flush()?;
 
-        Ok(Self { buffer_pool, catalog, free_mgr, file_header, log_manager, txn_mgr, log_path: log_path.to_string() })
+        Ok(Self { buffer_pool, catalog, free_mgr, file_header, log_manager, txn_mgr, log_path: log_path.to_string(), db_path: db_path.to_string() })
     }
 
     /// 从已有数据库文件恢复
-    fn load_existing(buffer_pool: Arc<BufferPool>, log_manager: Arc<LogManager>, log_path: &str) -> std::io::Result<Self> {
+    fn load_existing(buffer_pool: Arc<BufferPool>, log_manager: Arc<LogManager>, db_path: &str, log_path: &str) -> std::io::Result<Self> {
         let txn_mgr = Arc::new(Mutex::new(TransactionManager::new(log_manager.clone())));
         // Page 0: 读取 FileHeader
         let page0 = buffer_pool.fetch_page(0)?;
@@ -118,7 +123,7 @@ impl Database {
         catalog.rebuild_free_bitmap(&mut free_mgr);
         free_mgr.flush(&buffer_pool)?;
 
-        Ok(Self { buffer_pool, catalog, free_mgr, file_header, log_manager, txn_mgr, log_path: log_path.to_string() })
+        Ok(Self { buffer_pool, catalog, free_mgr, file_header, log_manager, txn_mgr, log_path: log_path.to_string(), db_path: db_path.to_string() })
     }
 
     // ==================== DDL ====================
@@ -180,14 +185,92 @@ impl Database {
         self.log_manager.flush()?;
         Ok(())
     }
+    
 
     /// 获取内部组件引用（Table 的 insert/delete 需要用到）
     pub fn buffer_pool(&self) -> &Arc<BufferPool> { &self.buffer_pool }
     pub fn log_manager(&self) -> &Arc<LogManager> { &self.log_manager }
     /// 当前实例的 WAL 路径（测试隔离后不能再用全局 config::LOG_FILE）
     pub fn log_path(&self) -> &str { &self.log_path }
+    /// 当前实例的 db 文件路径（多库时 CREATE DATABASE 用它定位同目录）
+    pub fn db_path(&self) -> &str { &self.db_path }
     pub fn catalog_mut(&mut self) -> &mut Catalog { &mut self.catalog }
     pub fn free_mgr_mut(&mut self) -> &mut FreePageManager { &mut self.free_mgr }
     pub fn txn_mgr(&self) -> &Arc<Mutex<TransactionManager>> { &self.txn_mgr }
 
+}
+// ==================== 多库注册表 ====================
+
+/// 进程内的库集合：默认库常驻，其它库按需打开并缓存。
+/// 默认库同时充当「实例级账号库」（__minidb_users 只有一份，在这里）。
+pub struct DbRegistry {
+    root: PathBuf,                  // 库文件所在目录（从默认库的路径推出）
+    default_name: String,           // 默认库名（文件名去掉扩展名）
+    default_db: Database,
+    others: HashMap<String, Database>,
+}
+
+impl DbRegistry {
+    pub fn new(default_db: Database) -> Self {
+        let p = PathBuf::from(default_db.db_path());
+        let root = p.parent()
+            .map(|x| x.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let default_name = p.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "main".to_string());
+        Self { root, default_name, default_db, others: HashMap::new() }
+    }
+
+    /// 按会话的 current_db 取「当前库」和「账号库」。
+    ///   - current = 默认库 → accounts = None（同一个对象，不需要第二个写入口）
+    ///   - current = 其它库 → accounts = Some(默认库)
+    pub fn resolve(
+        &mut self,
+        name: Option<&str>,
+    ) -> Result<(&mut Database, Option<&mut Database>), String> {
+        let name = match name {
+            None => return Ok((&mut self.default_db, None)),
+            Some(n) => n,
+        };
+        if name == self.default_name {
+            return Ok((&mut self.default_db, None));
+        }
+
+        self.ensure_open(name)?;
+
+        let cur = self.others.get_mut(name)
+            .ok_or_else(|| format!("database '{}' does not exist", name))?;
+        // 两个不相交的字段，可以同时可变借用
+        Ok((cur, Some(&mut self.default_db)))
+    }
+
+    /// 懒加载：第一次访问某个库时才 open（会跑一遍崩溃恢复）
+    fn ensure_open(&mut self, name: &str) -> Result<(), String> {
+        if self.others.contains_key(name) {
+            return Ok(());
+        }
+        let db_file = self.root.join(format!("{}.db", name));
+        let log_file = self.root.join(format!("{}.log", name));
+
+        // 存在性判断用 exists()，绝不用 open_at 试探（它会创建）
+        if !db_file.exists() {
+            return Err(format!("database '{}' does not exist", name));
+        }
+
+        let db_s = db_file.to_string_lossy().to_string();
+        let log_s = log_file.to_string_lossy().to_string();
+        let db = Database::open_at(&db_s, &log_s)
+            .map_err(|e| format!("open database '{}': {}", name, e))?;
+        self.others.insert(name.to_string(), db);
+        Ok(())
+    }
+
+    /// 退出时统一刷盘
+    pub fn shutdown(&mut self) {
+        for db in self.others.values_mut() {
+            let _ = db.shutdown();
+        }
+        let _ = self.default_db.shutdown();
+    }
 }
