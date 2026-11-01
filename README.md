@@ -151,8 +151,8 @@ DELETE FROM users WHERE id = 1;
 -- 聚合与分组
 SELECT age, COUNT(*) FROM users GROUP BY age HAVING COUNT(*) > 1;
 
--- 连接
-SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.uid;
+-- 连接（不支持表别名，用限定列名）
+SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.uid;
 
 -- 视图
 CREATE VIEW adult AS SELECT * FROM users WHERE age >= 18;
@@ -189,7 +189,8 @@ BEGIN;  COMMIT;  ROLLBACK;
 
 - 字段以 **TAB** 分隔，字段内的 `\t` / `\n` / `\\` 转义；
 - NULL 写作 **`\N`**（与 MySQL `LOAD DATA` 习惯一致），不是空串；
-- 表头行在前，列数与行数可让客户端预分配。
+- 表头行在前，列数与行数可让客户端预分配；
+- **空行会被忽略且不产生任何应答**（`quit` 例外，回 `OK 0`）。客户端必须保证「发一条、收一条」，不要发送空语句，否则会等不到回复。
 
 示例：
 
@@ -214,6 +215,8 @@ Java 侧（`simple-dbms-backend/client-app`）不使用 JDBC，直接按上述�
 
 **连接后若库中已存在任何用户，必须先发 `LOGIN <user> PASSWORD '<pwd>'`，否则所有语句都会返回 `please LOGIN first`。** 新库在没有任何用户时是开放状态（首次部署免登录即可建库建表）。
 
+实测注意（已联调验证）：`MiniDbConnection` 只带 host/port，**本身不发 `LOGIN`**；图形控制台可以手工输入 `LOGIN` 语句，但仓库管理 GUI（`com.dbms.client.App`）没有登录入口。因此**一旦库里创建了用户，业务 GUI 的所有操作都会失败**。两种收口方式：给连接串加账号字段并在 `MiniDbConnection` 建连后自动登录，或让服务端在握手阶段接收凭证。演示前若未做此改造，请使用没有用户的库。
+
 ---
 
 ## 8. 已知限制
@@ -227,7 +230,7 @@ Java 侧（`simple-dbms-backend/client-app`）不使用 JDBC，直接按上述�
 5. **WAL 无检查点、无日志截断**。日志只增不减，长期运行会持续增长，需手动清理或重启归档。
 6. **`DEFAULT` 值受 `u32` 限制**。列默认值以 `DefaultVal::Int(u32)` 存储，且解析处是 `n as u32`：`DEFAULT -1` 会变成 `4294967295`，`DEFAULT 5000000000` 同样回绕。DDL 阶段既不校验范围，也不校验默认值与列类型是否匹配（`INT` 列 `DEFAULT 'abc'` 会被接受，错误延迟到写入该列时才暴露）。
 7. **视图列名是创建时刻的快照**。基表列被 `RENAME COLUMN` 后，视图会在下次查询时报 `column 'x' not found`，与基表被 `DROP` 时的延迟失效行为一致；未做级联更新。
-8. **SQL 子集**。无子查询、无 `UNION`、无 `ALTER TABLE ADD/DROP COLUMN`、无外键、无 `CHECK` 约束；类型仅 `INT` 与 `VARCHAR(n)`。
+8. **SQL 子集**。无子查询、无 `UNION`、无 `ALTER TABLE ADD/DROP COLUMN`、无外键、无 `CHECK` 约束；类型仅 `INT` 与 `VARCHAR(n)`。**不支持表别名**（`FROM users u`、`FROM users AS u` 均报语法错误）与逗号连接（`FROM a, b`），多表连接必须写成 `FROM a JOIN b ON a.x = b.x` 并用全限定列名。
 9. **口令哈希非 KDF**。FNV-1a 64 位、无盐无迭代，仅满足教学演示，不可用于生产；客户端侧算法需与引擎保持一致才能登录。
 
 ---
