@@ -56,6 +56,10 @@ fn handle_client(stream: TcpStream, reg: Arc<Mutex<DbRegistry>>) -> std::io::Res
         let sql = line.trim();
 
         if sql.is_empty() {
+            // 协议约定：每个请求都必须有响应。空语句回 OK 0，否则客户端
+            // （GUI 里空编辑器点"执行"）会永久阻塞，等一个不会来的回复。
+            let _ = writer.write_all(b"OK 0\n");
+            let _ = writer.flush();
             continue;
         }
         if sql.eq_ignore_ascii_case("quit") {
@@ -264,11 +268,24 @@ pub fn run_repl(reg: &mut DbRegistry) {
             break;
         }
 
-        match reg.resolve(session.current_db.as_deref()) {
-            Ok((db, accounts)) => match run_sql(sql, db, accounts, &mut session) {
-                Ok(rs) => println!("{}", format_for_human(&rs)),
-                Err(e) => println!("ERROR: {}", e),
+        let outcome = match reg.resolve(session.current_db.as_deref()) {
+            Ok((db, accounts)) => run_sql(sql, db, accounts, &mut session),
+            Err(e) => Err(e),
+        };
+
+        // 与 TCP 路径同一套延迟动作：resolve 借出的 &mut Database 必须先归还，
+        // 否则 reg.drop_db &mut self 会撞 E0499。少了这段，REPL 里 DROP DATABASE
+        // 会打印 OK 但一个文件都不删。
+        let outcome = match outcome {
+            Ok(rs) => match session.pending_drop_db.take() {
+                Some(name) => reg.drop_db(&name).map(|_| rs),
+                None => Ok(rs),
             },
+            Err(e) => Err(e),
+        };
+
+        match outcome {
+            Ok(rs) => println!("{}", format_for_human(&rs)),
             Err(e) => println!("ERROR: {}", e),
         }
     }

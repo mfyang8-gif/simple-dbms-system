@@ -26,7 +26,7 @@ simple-dbms-project/
 └── docs/                       # 课程报告与自评表（见第 9 节）
 ```
 
-Java 客户端在独立工作树（`simple-dbms-backend`），包名 `com.dbms.client`，通过本协议直连引擎，不使用 JDBC。
+Java 客户端在**同一仓库的 `dev-client` 分支**（worktree 为 `../simple-dbms-backend`），包名 `com.dbms.client`，通过本协议直连引擎，不使用 JDBC。注意：`dev-engine` 分支上的 `client-app/` 只有一个 0 字节占位 `README.MD`，客户端源码不在本分支的工作区里。
 
 ---
 
@@ -190,7 +190,7 @@ BEGIN;  COMMIT;  ROLLBACK;
 - 字段以 **TAB** 分隔，字段内的 `\t` / `\n` / `\\` 转义；
 - NULL 写作 **`\N`**（与 MySQL `LOAD DATA` 习惯一致），不是空串；
 - 表头行在前，列数与行数可让客户端预分配；
-- **空行会被忽略且不产生任何应答**（`quit` 例外，回 `OK 0`）。客户端必须保证「发一条、收一条」，不要发送空语句，否则会等不到回复。
+- **空行（含纯空格、纯 TAB）回 `OK 0`**，`quit` 同样回 `OK 0` 后断开——每个请求都保证有且只有一条应答，客户端可以严格「发一条、收一条」。
 
 示例：
 
@@ -207,7 +207,7 @@ BEGIN;  COMMIT;  ROLLBACK;
 
 ## 7. 客户端集成
 
-Java 侧（`simple-dbms-backend/client-app`）不使用 JDBC，直接按上述协议收发：
+Java 侧（`dev-client` 分支的 `client-app`）不使用 JDBC，直接按上述协议收发：
 
 - `MiniDbConnection`：host + port，建立 TCP 长连接；
 - `MiniDbStatement`：`executeQuery` 发 SQL，`ResultSet` 解析 `ROWS/END`；
@@ -215,7 +215,11 @@ Java 侧（`simple-dbms-backend/client-app`）不使用 JDBC，直接按上述�
 
 **连接后若库中已存在任何用户，必须先发 `LOGIN <user> PASSWORD '<pwd>'`，否则所有语句都会返回 `please LOGIN first`。** 新库在没有任何用户时是开放状态（首次部署免登录即可建库建表）。
 
-实测注意（已联调验证）：`MiniDbConnection` 只带 host/port，**本身不发 `LOGIN`**；图形控制台可以手工输入 `LOGIN` 语句，但仓库管理 GUI（`com.dbms.client.App`）没有登录入口。因此**一旦库里创建了用户，业务 GUI 的所有操作都会失败**。两种收口方式：给连接串加账号字段并在 `MiniDbConnection` 建连后自动登录，或让服务端在握手阶段接收凭证。演示前若未做此改造，请使用没有用户的库。
+实测注意（已联调验证）：`MiniDbConnection` 只带 host/port，**本身不发 `LOGIN`**；图形控制台可以手工输入 `LOGIN` 语句，但仓库管理 GUI（`com.dbms.client.App`）没有登录入口。因此**一旦库里创建了用户，业务 GUI 的所有操作都会失败**（实测返回 `please LOGIN first`）。
+
+演示编排上的规避办法：**GUI 段排在权限段之前**——先用零用户的库演示增删改查 / JOIN / 视图 / 聚合（零用户时允许本地匿名，GUI 直接可用），再用 REPL 演示 `CREATE USER` / `GRANT` / 越权被拒 / 事务回滚 / 崩溃恢复（这一段本来就要看错误原文）。顺序不能颠倒。
+
+本节涉及的客户端行为，是在 `dev-client` 工作区的源码上编译验证的（含该工作区当时未提交的改动），不是 `dev-engine` 分支的内容，也不是 10-27 构建的旧 jar。
 
 ---
 
