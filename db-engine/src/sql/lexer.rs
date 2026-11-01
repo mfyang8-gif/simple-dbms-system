@@ -146,6 +146,7 @@ impl Lexer {
                     "ALL" => Ok(Token::All),
                     "DATABASE" => Ok(Token::Database),
                     "USE" => Ok(Token::Use),
+                    "VIEW" => Ok(Token::View),
                     _ => Ok(Token::Ident(s)),
                 }
 
@@ -319,4 +320,17 @@ mod tests {
     fn test_having_is_keyword() {
         assert_eq!(tokens("HAVING"), vec![Token::Having, Token::Eof]);
     }
+    // ... existing code ...
+    #[test]
+    fn test_view_keyword() {
+        assert_eq!(
+            tokens("CREATE VIEW v AS SELECT * FROM t"),
+            vec![
+                Token::Create, Token::View, Token::Ident("v".into()), Token::As,
+                Token::Select, Token::Star, Token::From, Token::Ident("t".into()),
+                Token::Eof
+            ]
+        );
+    }
+
 }

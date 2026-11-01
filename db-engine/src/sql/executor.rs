@@ -162,11 +162,11 @@ impl Session {
 // 为什么用「内部表」而不是另开一个 users.db：
 // 能白拿 Table 的 WAL、Catalog、FreePageManager、事务和崩溃恢复。
 // 代价只是这两张表会出现在 list_tables() 里（交付报告里写明即可）。
-
 const USERS_TABLE: &str = "__minidb_users";
 const PRIVS_TABLE: &str = "__minidb_privs";
+/// 视图元数据表：definition 是规范化 SQL，base_tables/columns 是建视图时算好的快照
+const VIEWS_TABLE: &str = "__minidb_views";
 pub const INTERNAL_PREFIX: &str = "__minidb_";
-
 /// 口令摘要：FNV-1a 64 位 → 16 个十六进制字符。
 /// 零依赖、确定、可重复；但它**不是 KDF**（无 salt、无迭代），
 /// 报告里必须写明“生产环境应换 bcrypt / argon2”。
@@ -202,6 +202,55 @@ fn ensure_privs_table(db: &mut Database) -> Result<(), String> {
         ]).map_err(|e| format!("create {}: {}", PRIVS_TABLE, e))?;
     }
     Ok(())
+}
+/// 只建视图元数据表（建在「当前库」上）
+fn ensure_views_table(db: &mut Database) -> Result<(), String> {
+    if db.get_table_meta(VIEWS_TABLE).is_none() {
+        db.create_table(VIEWS_TABLE, vec![
+            Column::varchar("view_name", 64).primary_key(),
+            Column::varchar("definition", 512).not_null(),
+            Column::varchar("base_tables", 200).not_null(),
+            Column::varchar("columns", 400).not_null(),
+        ]).map_err(|e| format!("create {}: {}", VIEWS_TABLE, e))?;
+    }
+    Ok(())
+}
+
+/// 一条视图的元数据。
+/// base_tables / columns 是「建视图那一刻」算好的快照，查询时不再解析 SQL 去推。
+#[derive(Debug, Clone)]
+struct ViewMeta {
+    definition: String,     // 规范化 SQL，可直接重新 parse
+    base_tables: Vec<String>,
+    columns: Vec<String>,   // 视图的输出列名（* 已展开成具体列）
+}
+
+fn split_list(s: &str) -> Vec<String> {
+    s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect()
+}
+
+/// 读一条视图元数据。**只读**：表不存在就返回 None，
+/// 绝不能调 ensure_views_table（否则一次失败的 SELECT 会在库里凭空建表）。
+fn load_view(db: &Database, name: &str) -> Result<Option<ViewMeta>, String> {
+    if db.get_table_meta(VIEWS_TABLE).is_none() {
+        return Ok(None);
+    }
+    let t = db.open_table(VIEWS_TABLE).map_err(|e| e.to_string())?;
+    for (_, rec) in t.scan_all().map_err(|e| e.to_string())? {
+        let vals = decode_row(&t, &rec)?;
+        let (n, def, bases, cols) = match (vals.first(), vals.get(1), vals.get(2), vals.get(3)) {
+            (Some(Value::Str(n)), Some(Value::Str(d)), Some(Value::Str(b)), Some(Value::Str(c))) => (n, d, b, c),
+            _ => continue,
+        };
+        if n == name {
+            return Ok(Some(ViewMeta {
+                definition: def.clone(),
+                base_tables: split_list(bases),
+                columns: split_list(cols),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// 执行一条 AST，返回结果集
@@ -547,7 +596,10 @@ fn authorize(
         Statement::CreateTable { .. } | Statement::DropTable { .. }
         | Statement::CreateUser { .. } | Statement::Grant { .. } | Statement::Revoke { .. }
         // 建库不是“对某张表的权限”，只有 admin 能做（靠 ⑦ 的 (_, None) 分支）
+        | Statement::CreateDatabase { .. }
+        // 建视图同理：视图名不是表名，走“admin required”
         | Statement::CreateDatabase { .. } => None,
+        Statement::CreateView { .. } => None,
 
 
     };
@@ -562,6 +614,9 @@ fn authorize(
         Statement::CreateUser { .. } | Statement::Login { .. }
         | Statement::Begin | Statement::Commit | Statement::Rollback
         // 库名不是表名，不能塞进 touched（否则会误触内部表前缀检查）
+
+        // 视图名也不是表名；它引用的基表在 Step 4 单独校验
+        | Statement::CreateView { .. } => None,
         | Statement::CreateDatabase { .. } | Statement::Use { .. } => None,
     };
 
@@ -617,12 +672,142 @@ fn authorize(
         (None, Some(_)) => Err("permission denied".to_string()),
     }
 }
+/// 把「查视图」改写成「查基表」。
+///
+/// 只做三件事：
+///   1. 外层 * → 视图的列清单（不是基表的全部列）
+///   2. 视图定义里的 WHERE 保留，与外层 WHERE 用 AND 合并
+///   3. 表名换成基表名
+/// 其余子句（DISTINCT / GROUP BY / HAVING / ORDER BY / LIMIT）原样下推，
+/// 因为建视图时已经拒绝了会让合并失效的写法。
+fn expand_views(stmt: Statement, db: &Database) -> Result<Statement, String> {
+    // ① 视图只读：写操作在入口就拒，别等到 open_table 报「表不存在」
+    let write_target = match &stmt {
+        Statement::Insert { table, .. }
+        | Statement::Update { table, .. }
+        | Statement::Delete { table, .. } => Some(table.clone()),
+        _ => None,
+    };
+    if let Some(t) = write_target {
+        if load_view(db, &t)?.is_some() {
+            return Err(format!("view '{}' is read-only", t));
+        }
+        return Ok(stmt);
+    }
+
+    // ② 只有 SELECT 需要展开；其它语句原样返回
+    let target = match &stmt {
+        Statement::Select { table, .. } => table.clone(),
+        _ => return Ok(stmt),
+    };
+    // 是普通表 → 不动
+    if db.get_table_meta(&target).is_some() {
+        return Ok(stmt);
+    }
+    // 既不是表也不是视图 → 原样返回，让 execute_select 报原来的错误文案
+    let Some(meta) = load_view(db, &target)? else {
+        return Ok(stmt);
+    };
+
+    let Statement::Select {
+        distinct, columns, table: _, joins, filter, group_by, having, order_by, limit,
+    } = stmt else {
+        unreachable!("上面已经确认是 Select")
+    };
+
+    // ① 重新解析定义（存的是规范化 SQL，parser 往返测试保证等价）
+    let def = {
+        let tokens = crate::sql::lexer::Lexer::new(&meta.definition)
+            .tokenize()
+            .map_err(|e| format!("view '{}' has invalid definition: {}", target, e))?;
+        crate::sql::parser::Parser::new(tokens)
+            .parse()
+            .map_err(|e| format!("view '{}' has invalid definition: {}", target, e))?
+    };
+    let Statement::Select {
+        columns: inner_cols, table: inner_table, filter: inner_filter, ..
+    } = def else {
+        return Err(format!("view '{}' has invalid definition", target));
+    };
+
+    // ② 延迟失效检查（Q6 的乙方案）：基表被删了，查询时才报
+    if db.get_table_meta(&inner_table).is_none() {
+        return Err(format!(
+            "view '{}' is invalid: base table '{}' not found",
+            target, inner_table
+        ));
+    }
+
+    // ③ 视图不参与 JOIN（合并语义会变复杂，入口处拒绝）
+    if !joins.is_empty() {
+        return Err(format!("view '{}' cannot be used in JOIN", target));
+    }
+
+    // ④ 外层 SELECT 列表：* 展开成视图的列，v.id 规范成 id
+    let mut out_cols: Vec<SelectItem> = Vec::new();
+    for c in columns {
+        match c {
+            SelectItem::Star => {
+                for ic in &inner_cols {
+                    if matches!(ic, SelectItem::Star) {
+                        return Err(format!("view '{}' has an unresolved '*'", target));
+                    }
+                    out_cols.push(ic.clone());
+                }
+            }
+            SelectItem::TableColumn { table: t, col } if t == target => {
+                out_cols.push(SelectItem::Column(col));
+            }
+            other => out_cols.push(other),
+        }
+    }
+
+    // ⑤ 外层引用的列必须属于这个视图（视图外的列不许透视）
+    let view_cols: HashSet<&str> = meta.columns.iter().map(|s| s.as_str()).collect();
+    for c in &out_cols {
+        let name = match c {
+            SelectItem::Column(n) => n.as_str(),
+            SelectItem::TableColumn { col, .. } => col.as_str(),
+            SelectItem::Aggregate { column, .. } => column.as_str(),
+            SelectItem::Star => continue,
+        };
+        if !view_cols.contains(name) {
+            return Err(format!("column '{}' not found in view '{}'", name, target));
+        }
+    }
+
+    // ⑥ 合并过滤条件：定义的条件必须保留，否则视图退化成「基表的别名」
+    let merged_filter = match (inner_filter, filter) {
+        (Some(a), Some(b)) => Some(Expr::And(Box::new(a), Box::new(b))),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    };
+
+    Ok(Statement::Select {
+        distinct,
+        columns: out_cols,
+        table: inner_table,
+        joins: vec![],
+        filter: merged_filter,
+        group_by,
+        having,
+        order_by,
+        limit,
+    })
+}
+
+
+
 pub fn execute(
     stmt: Statement,
     db: &mut Database,
     accounts: Option<&mut Database>,
     session: &mut Session,
 ) -> Result<ResultSet, String> {
+    // 视图展开必须在 authorize 之前：
+    // 展开后 touched 就是基表，权限闸门天然做到「能看视图 ⟺ 能看基表」。
+    // db 以 & 传入，调用结束后可变借用立刻解冻，下面 authorize 借用不受影响。
+    let stmt = expand_views(stmt, db)?;
     // 这里把 &mut 降级成 & 送进 authorize：两个不可变借用可以共存
     authorize(&stmt, db, accounts.as_deref(), session)?;
     match stmt {
@@ -630,7 +815,7 @@ pub fn execute(
             execute_create_table(name, columns, db)
         }
         Statement::DropTable { name } => execute_drop_table(name, db),
-        Statement::Insert { table, columns, values } => execute_insert(table, columns, values, db, session),
+        Statement::Insert { table, columns, rows } => execute_insert(table, columns, rows, db, session),
         Statement::Select { distinct, columns, table, joins, filter, group_by, having, order_by, limit, .. } => {
             execute_select(columns, distinct, table, joins, filter, group_by, having, order_by, limit, db)
         },
@@ -682,15 +867,133 @@ pub fn execute(
         Statement::Revoke { privs, table, user } => execute_revoke(privs, table, user, db, session),
         Statement::CreateDatabase { name } => execute_create_database(name, db),
         Statement::Use { name } => execute_use(name, db, session),
+        // Step 3 接入真正的实现，先占位保证编译
+        Statement::CreateView { name, query } => execute_create_view(name, *query, db, session),
     }
+    }
+
+
+fn execute_create_view(
+    name: String,
+    query: Statement,
+    db: &mut Database,
+    session: &mut Session,
+) -> Result<ResultSet, String> {
+    // ① 名字查重：表名、视图名、保留前缀
+    if db.get_table_meta(&name).is_some() {
+        return Err(format!("table '{}' already exists", name));
+    }
+    if name.starts_with(INTERNAL_PREFIX) {
+        return Err(format!("'{}' is a reserved name", name));
+    }
+    ensure_views_table(db)?;
+    if load_view(db, &name)?.is_some() {
+        return Err(format!("view '{}' already exists", name));
+    }
+
+    // ② 定义必须是「可下推」的简单查询：单表 + 投影 + WHERE。
+    //    合并展开只在这些子句上语义等价，其余一律在入口拒绝（宁可拒绝，不可错误地允许）。
+    let Statement::Select { distinct, columns, table, joins, filter, group_by, having, order_by, limit } = query
+    else {
+        return Err("view definition must be a SELECT".to_string());
+    };
+    if distinct {
+        return Err("view definition does not support DISTINCT".into());
+    }
+    if !joins.is_empty() {
+        return Err("view definition does not support JOIN".into());
+    }
+    if !group_by.is_empty() || having.is_some() {
+        return Err("view definition does not support GROUP BY / HAVING".into());
+    }
+    if !order_by.is_empty() {
+        return Err("view definition does not support ORDER BY".into());
+    }
+    if limit.is_some() {
+        return Err("view definition does not support LIMIT".into());
+    }
+
+    // ③ 基表必须真实存在，且不能是视图（禁止视图套视图），也不能是内部表
+    if table.starts_with(INTERNAL_PREFIX) {
+        return Err(format!("cannot create a view over internal table '{}'", table));
+    }
+    if load_view(db, &table)?.is_some() {
+        return Err(format!("view '{}' cannot be based on another view", table));
+    }
+    let base = db.open_table(&table)
+        .map_err(|_| format!("table '{}' does not exist", table))?;
+    let base_cols: Vec<String> = base.columns.iter().map(|c| c.name.clone()).collect();
+
+    // ④ 展开 *：此刻手里有基表 schema，就地换成具体列名
+    let mut out_columns: Vec<SelectItem> = Vec::new();
+    let mut out_names: Vec<String> = Vec::new();
+    for item in columns {
+        match item {
+            SelectItem::Star => {
+                for c in &base_cols {
+                    out_columns.push(SelectItem::Column(c.clone()));
+                    out_names.push(c.clone());
+                }
+            }
+            SelectItem::Column(c) => {
+                if !base_cols.iter().any(|x| x == &c) {
+                    return Err(format!("column '{}' not found in table '{}'", c, table));
+                }
+                out_names.push(c.clone());
+                out_columns.push(SelectItem::Column(c));
+            }
+            // t.id 统一规范成 id：视图的列名不该带基表前缀
+            SelectItem::TableColumn { table: t, col } => {
+                if t != table || !base_cols.iter().any(|x| x == &col) {
+                    return Err(format!("column '{}.{}' not found in table '{}'", t, col, table));
+                }
+                out_names.push(col.clone());
+                out_columns.push(SelectItem::Column(col));
+            }
+            SelectItem::Aggregate { .. } => {
+                return Err("view definition does not support aggregate".into());
+            }
+        }
+    }
+
+    // ⑤ 存「规范化 SQL」而不是用户原文：parser 手上只有 token，拿不到原文
+    let definition = crate::sql::parser::select_to_sql(&Statement::Select {
+        distinct: false,
+        columns: out_columns,
+        table: table.clone(),
+        joins: vec![],
+        filter,
+        group_by: vec![],
+        having: None,
+        order_by: vec![],
+        limit: None,
+    })?;
+
+    // ⑥ 落盘：走 insert_in_txn，BEGIN / ROLLBACK 能一起回滚
+    let mut views = db.open_table(VIEWS_TABLE).map_err(|e| e.to_string())?;
+    let row = views
+        .new_row()
+        .put_varchar(&name).map_err(|e| e.to_string())?
+        .put_varchar(&definition).map_err(|e| e.to_string())?
+        .put_varchar(&table).map_err(|e| e.to_string())?
+        .put_varchar(&out_names.join(",")).map_err(|e| e.to_string())?
+        .build().map_err(|e| e.to_string())?;
+    db.insert_in_txn(&mut views, row, session.txn_id)
+        .map_err(|e| format!("create view failed: {}", e))?;
+
+    Ok(ResultSet::Ok)
 }
-
-
 fn execute_drop_table(name: String, db: &mut Database) -> Result<ResultSet, String> {
     db.drop_table(&name).map_err(|e| format!("drop_table failed: {}", e))?;
     Ok(ResultSet::Ok)
 }
-fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, db: &mut Database, session: &mut Session) -> Result<ResultSet, String> {
+fn execute_insert(
+    table_name: String,
+    columns: Vec<String>,
+    rows: Vec<Vec<Expr>>,
+    db: &mut Database,
+    session: &mut Session,
+) -> Result<ResultSet, String> {
     // 1. 打开表（拿到 schema）
     let mut table = db.open_table(&table_name)
         .map_err(|e| format!("open_table failed: {}", e))?;
@@ -706,10 +1009,7 @@ fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, d
         }).collect::<Result<Vec<usize>, String>>()?
     };
 
-    // 3. 严格校验：值数量必须等于目标列数量；重复列名不能默默后者覆盖前者
-    if values.len() != targets.len() {
-        return Err(format!("expected {} values, got {}", targets.len(), values.len()));
-    }
+    // 3. 列名校验只做一次：所有行共用同一套 targets / slot_of
     let mut slot_of: Vec<Option<usize>> = vec![None; table.columns.len()];
     for (v_idx, &col_idx) in targets.iter().enumerate() {
         if slot_of[col_idx].is_some() {
@@ -718,34 +1018,77 @@ fn execute_insert(table_name: String, columns: Vec<String>, values: Vec<Expr>, d
         slot_of[col_idx] = Some(v_idx);
     }
 
-    // 4. 逐列构造 Row（按 schema 顺序走完每一列）：
-    //    没被点名的列：有 DEFAULT 就用默认值，没 DEFAULT 才写 NULL（能不能空交给 Table 层判）；
-    //    类型/长度/NOT NULL 校验全部下沉到 Table 层的 TypedRowBuilder
-    let mut builder = table.new_row();
-    for (i, col) in table.columns.iter().enumerate() {
-        builder = match slot_of[i] {
-            None => match &col.default_value {
-                Some(DefaultVal::Int(v)) => builder.put_int(*v),
-                Some(DefaultVal::Varchar(s)) => builder.put_varchar(s),
-                None => builder.put_null(),
-            },
-            Some(v_idx) => match &values[v_idx] {
-                Expr::Literal(LitValue::Number(n)) => builder.put_int(*n as u32),
-                Expr::Literal(LitValue::Str(s)) => builder.put_varchar(s),
-                Expr::Literal(LitValue::Null) => builder.put_null(),
-                other => {
-                    return Err(format!("type mismatch on column '{}': got {:?}", col.name, other));
-                }
-            },
+    // 4. 先把每一行都编码出来：类型 / 值个数 / NOT NULL 的错误在任何一行入库前暴露
+    let mut built: Vec<Row> = Vec::with_capacity(rows.len());
+    for values in &rows {
+        if values.len() != targets.len() {
+            return Err(format!("expected {} values, got {}", targets.len(), values.len()));
         }
-            .map_err(|e| e.to_string())?;
+        let mut builder = table.new_row();
+        for (i, col) in table.columns.iter().enumerate() {
+            builder = match slot_of[i] {
+                None => match &col.default_value {
+                    Some(DefaultVal::Int(v)) => builder.put_int(*v),
+                    Some(DefaultVal::Varchar(s)) => builder.put_varchar(s),
+                    None => builder.put_null(),
+                },
+                Some(v_idx) => match &values[v_idx] {
+                    Expr::Literal(LitValue::Number(n)) => builder.put_int(*n as u32),
+                    Expr::Literal(LitValue::Str(s)) => builder.put_varchar(s),
+                    Expr::Literal(LitValue::Null) => builder.put_null(),
+                    other => {
+                        return Err(format!("type mismatch on column '{}': got {:?}", col.name, other));
+                    }
+                },
+            }
+                .map_err(|e| e.to_string())?;
+        }
+        built.push(builder.build().map_err(|e| format!("row build failed: {}", e))?);
     }
-    let row = builder.build().map_err(|e| format!("row build failed: {}", e))?;
 
-    // 5. 调存储层（session 有事务 → 加入该事务；否则自动提交）
-    db.insert_in_txn(&mut table, row, session.txn_id)
-        .map_err(|e| format!("insert failed: {}", e))?;
-    Ok(ResultSet::Affected(1))
+    // 5. 落库：单行沿用自动提交；多行套一个隐式事务，
+    //    保证「要么全进去，要么一行都不留」——否则第 2 行主键冲突时第 1 行已经提交了
+    let count = built.len();
+    let mut implicit_txn = None;
+    let txn = match session.txn_id {
+        Some(id) => Some(id),
+        None if count > 1 => {
+            let (id, _) = db.txn_mgr().lock().unwrap().begin();
+            implicit_txn = Some(id);
+            Some(id)
+        }
+        None => None,
+    };
+
+    let mut failure: Option<std::io::Error> = None;
+    for row in built {
+        if let Err(e) = db.insert_in_txn(&mut table, row, txn) {
+            failure = Some(e);
+            break;
+        }
+    }
+
+    match (failure, implicit_txn) {
+        (None, Some(id)) => {
+            db.txn_mgr().lock().unwrap().commit(id);
+            Ok(ResultSet::Affected(count))
+        }
+        (None, None) => Ok(ResultSet::Affected(count)),
+        (Some(e), Some(id)) => {
+            // 隐式事务回滚：把已经插进去的行全部 undo 掉
+            let last_lsn = db.txn_mgr().lock().unwrap().last_lsn(id);
+            let _ = crate::recovery::restore::undo_txn(
+                id,
+                last_lsn,
+                db.buffer_pool(),
+                db.log_manager(),
+                db.log_path(),
+            );
+            db.txn_mgr().lock().unwrap().abort(id);
+            Err(format!("insert failed: {}", e))
+        }
+        (Some(e), None) => Err(format!("insert failed: {}", e)),
+    }
 }
 /// 在列名空间里解析一个列引用 → 下标。
 ///
@@ -1569,9 +1912,15 @@ fn execute_update(
     }
     check_update_unique_keys(&table, &plan)?;
 
-    // ④ 真正落盘：删旧 + 插新。两步都挂在同一条事务链上，ROLLBACK 能整体还原
+    // ④ 落盘：优先原地覆盖；只有记录变长放不下时才退化成「删旧 + 插新」
     let count = rows.len();
     for (row_id, row) in rows {
+        let in_place = table
+            .try_update_in_place(row_id, &row, db.txn_mgr(), session.txn_id)
+            .map_err(|e| format!("update row failed: {}", e))?;
+        if in_place {
+            continue;
+        }
         table.delete(row_id, db.txn_mgr(), session.txn_id)
             .map_err(|e| format!("delete old row failed: {}", e))?;
         db.insert_in_txn(&mut table, row, session.txn_id)
@@ -1911,39 +2260,7 @@ mod tests {
         let _ = db.shutdown();
     }
 
-    #[test]
-    fn test_e2e_update_rollback() {
-        let _guard = db_lock();
-        let mut db = open_test_db();
-        let mut session = Session::new();
 
-        exec_sql(&mut db, &mut session, "CREATE TABLE ur_emp (id INT PRIMARY KEY, name VARCHAR(50))").unwrap();
-        exec_sql(&mut db, &mut session, "INSERT INTO ur_emp VALUES (1, 'Alice')").unwrap();
-        exec_sql(&mut db, &mut session, "INSERT INTO ur_emp VALUES (2, 'Bob')").unwrap();
-
-        exec_sql(&mut db, &mut session, "BEGIN").unwrap();
-        exec_sql(&mut db, &mut session, "UPDATE ur_emp SET name = 'Zed' WHERE id = 1").unwrap();
-
-        // 事务里看得到新值
-        match exec_sql(&mut db, &mut session, "SELECT name FROM ur_emp WHERE id = 1").unwrap() {
-            ResultSet::Rows { rows, .. } => assert_eq!(cell(&rows[0][0]), "Zed"),
-            other => panic!("got {:?}", other),
-        }
-
-        exec_sql(&mut db, &mut session, "ROLLBACK").unwrap();
-        assert!(session.txn_id.is_none());
-
-        // 回滚后：旧值回来，行数不变
-        match exec_sql(&mut db, &mut session, "SELECT * FROM ur_emp ORDER BY id").unwrap() {
-            ResultSet::Rows { rows, .. } => {
-                assert_eq!(rows.len(), 2, "UPDATE 回滚后行数不能变");
-                assert_eq!(cells(&rows[0]), vec!["1".to_string(), "Alice".to_string()]);
-                assert_eq!(cells(&rows[1]), vec!["2".to_string(), "Bob".to_string()]);
-            }
-            other => panic!("got {:?}", other),
-        }
-        let _ = db.shutdown();
-    }
 
     #[test]
     fn test_e2e_select_order_by() {
@@ -2243,7 +2560,50 @@ mod tests {
 
         let _ = db.shutdown();
     }
+    #[test]
+    fn test_e2e_insert_multi_row() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
 
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE mr_t (id INT PRIMARY KEY, name VARCHAR(20))").unwrap();
+
+        // 多组括号 = 多行
+        assert!(matches!(
+            exec_sql(&mut db, &mut session,
+                     "INSERT INTO mr_t VALUES (1, 'A'), (2, 'B'), (3, 'C')").unwrap(),
+            ResultSet::Affected(3)
+        ));
+
+        // 带列名列表，且列序与 schema 不同 → 每一行都按同一套 targets 归一
+        assert!(matches!(
+            exec_sql(&mut db, &mut session,
+                     "INSERT INTO mr_t (name, id) VALUES ('D', 4), ('E', 5)").unwrap(),
+            ResultSet::Affected(2)
+        ));
+
+        match exec_sql(&mut db, &mut session, "SELECT COUNT(*) FROM mr_t").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![vec!["5".to_string()]]),
+            other => panic!("got {:?}", other),
+        }
+
+        // 第 2 行主键冲突 → 整条语句回滚，第 6 行不能留下
+        assert_err_contains(
+            exec_sql(&mut db, &mut session,
+                     "INSERT INTO mr_t VALUES (6, 'F'), (1, 'dup')"),
+            "Duplicate value",
+        );
+        match exec_sql(&mut db, &mut session, "SELECT COUNT(*) FROM mr_t").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(cells_all(&rows), vec![vec!["5".to_string()]],
+                           "失败的 INSERT 不该留下半截数据");
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
     /// DEFAULT：INSERT 没点名的列自动填默认值；显式给值（含显式 NULL）不覆盖默认值语义
     #[test]
     fn test_e2e_default_fill() {
@@ -2893,7 +3253,278 @@ mod tests {
 
         let _ = db.shutdown();
     }
+    // ==================== 视图端到端 ====================
 
+    #[test]
+    fn test_e2e_view_basic() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE v_t (id INT PRIMARY KEY, name VARCHAR(20), age INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO v_t VALUES (1, '张三', 20)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO v_t VALUES (2, '李四', 15)").unwrap();
+        exec_sql(&mut db, &mut session,
+                 "CREATE VIEW adults AS SELECT id, name FROM v_t WHERE age >= 18").unwrap();
+
+        // ① * 展开成视图的列，不是基表的全部列
+        match exec_sql(&mut db, &mut session, "SELECT * FROM adults").unwrap() {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
+                assert_eq!(cells_all(&rows),
+                           vec![vec!["1".to_string(), "张三".to_string()]]);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // ② 定义里的 WHERE 必须保留，否则视图退化成「基表的别名」
+        match exec_sql(&mut db, &mut session, "SELECT * FROM adults WHERE id = 2").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // ③ 视图名可以当限定符用：adults.id → id
+        match exec_sql(&mut db, &mut session, "SELECT adults.id FROM adults").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // ④ 视图外的列不许透视
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT age FROM adults"),
+                            "not found in view");
+
+        // ⑤ 基表不受影响
+        match exec_sql(&mut db, &mut session, "SELECT * FROM v_t").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_view_rejects_invalid_definitions() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE vr_t (id INT PRIMARY KEY, name VARCHAR(20))").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE VIEW vr_v AS SELECT id FROM vr_t").unwrap();
+
+        // 合并展开只对「单表 + 投影 + WHERE」语义等价，其余入口拒绝
+        assert_err_contains(exec_sql(&mut db, &mut session, "CREATE VIEW vr_a AS SELECT * FROM vr_t LIMIT 1"),
+                            "does not support LIMIT");
+        assert_err_contains(exec_sql(&mut db, &mut session, "CREATE VIEW vr_b AS SELECT * FROM vr_t GROUP BY id"),
+                            "GROUP BY");
+        assert_err_contains(exec_sql(&mut db, &mut session, "CREATE VIEW vr_c AS SELECT * FROM vr_t ORDER BY id"),
+                            "does not support ORDER BY");
+        assert_err_contains(exec_sql(&mut db, &mut session, "CREATE VIEW vr_d AS SELECT DISTINCT id FROM vr_t"),
+                            "does not support DISTINCT");
+
+        // 禁止视图套视图
+        assert_err_contains(exec_sql(&mut db, &mut session, "CREATE VIEW vr_e AS SELECT * FROM vr_v"),
+                            "based on another view");
+        // 基表必须存在、列必须存在
+        assert_err_contains(exec_sql(&mut db, &mut session, "CREATE VIEW vr_f AS SELECT * FROM nosuch_t"),
+                            "does not exist");
+        assert_err_contains(exec_sql(&mut db, &mut session, "CREATE VIEW vr_g AS SELECT ghost FROM vr_t"),
+                            "not found");
+        // 重名：既不能撞表，也不能撞视图
+        assert_err_contains(exec_sql(&mut db, &mut session, "CREATE VIEW vr_t AS SELECT id FROM vr_t"),
+                            "already exists");
+        assert_err_contains(exec_sql(&mut db, &mut session, "CREATE VIEW vr_v AS SELECT id FROM vr_t"),
+                            "already exists");
+
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_view_acl_uses_base_table() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE aclv_t (id INT PRIMARY KEY, secret VARCHAR(20))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO aclv_t VALUES (1, 's3cret')").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE VIEW aclv_v AS SELECT * FROM aclv_t").unwrap();
+
+        exec_sql(&mut db, &mut session, "CREATE USER alice PASSWORD 'pw123'").unwrap();
+        exec_sql(&mut db, &mut session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE USER bob PASSWORD 'pw456'").unwrap();
+        exec_sql(&mut db, &mut session, "LOGIN bob PASSWORD 'pw456'").unwrap();
+
+        // ① bob 没有基表权限 → 视图也查不了（视图不是越权通道）
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT * FROM aclv_v"),
+                            "permission denied: SELECT");
+
+        // ② 视图只读
+        assert_err_contains(exec_sql(&mut db, &mut session, "INSERT INTO aclv_v VALUES (2, 'x')"),
+                            "read-only");
+
+        // ③ 授权的对象是基表：授了基表，视图自然可查
+        exec_sql(&mut db, &mut session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        exec_sql(&mut db, &mut session, "GRANT SELECT ON aclv_t TO bob").unwrap();
+        exec_sql(&mut db, &mut session, "LOGIN bob PASSWORD 'pw456'").unwrap();
+        match exec_sql(&mut db, &mut session, "SELECT * FROM aclv_v").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // ④ 撤权立刻生效，视图跟着失效
+        exec_sql(&mut db, &mut session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        exec_sql(&mut db, &mut session, "REVOKE SELECT ON aclv_t FROM bob").unwrap();
+        exec_sql(&mut db, &mut session, "LOGIN bob PASSWORD 'pw456'").unwrap();
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT * FROM aclv_v"),
+                            "permission denied: SELECT");
+
+        // ⑤ 视图没有独立权限：GRANT ON view 不成立
+        exec_sql(&mut db, &mut session, "LOGIN alice PASSWORD 'pw123'").unwrap();
+        assert_err_contains(exec_sql(&mut db, &mut session, "GRANT SELECT ON aclv_v TO bob"),
+                            "does not exist");
+
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_view_persists_after_reopen() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE vp_t (id INT PRIMARY KEY, name VARCHAR(20))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO vp_t VALUES (1, 'Alice')").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE VIEW vp_v AS SELECT name FROM vp_t").unwrap();
+        db.shutdown().unwrap();
+        drop(db);
+
+        // 重开：定义从 __minidb_views 里恢复，重新解析后照样能查
+        let mut db = Database::open_at(TEST_DB, TEST_LOG).expect("reopen");
+        let mut session = Session::new();
+        match exec_sql(&mut db, &mut session, "SELECT * FROM vp_v").unwrap() {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["name".to_string()]);
+                assert_eq!(cells_all(&rows), vec![vec!["Alice".to_string()]]);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_view_invalid_after_base_table_dropped() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE vd_t (id INT PRIMARY KEY)").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE VIEW vd_v AS SELECT id FROM vd_t").unwrap();
+        exec_sql(&mut db, &mut session, "DROP TABLE vd_t").unwrap();
+
+        // 延迟失效：视图定义还在，但查的时候明确告诉你基表没了
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT * FROM vd_v"),
+                            "is invalid");
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_update_in_place() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE up_t (id INT PRIMARY KEY, name VARCHAR(20), age INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO up_t VALUES (1, 'Alice', 20)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO up_t VALUES (2, 'Bob', 30)").unwrap();
+
+        // 定长字段改值 → 长度不变 → 原地覆盖，行的物理位置必须不动
+        let before_ids: Vec<RowId> = db.open_table("up_t").unwrap()
+            .scan_all().unwrap().iter().map(|(id, _)| *id).collect();
+        assert!(matches!(
+            exec_sql(&mut db, &mut session, "UPDATE up_t SET age = 21 WHERE id = 1").unwrap(),
+            ResultSet::Affected(1)
+        ));
+        let after_ids: Vec<RowId> = db.open_table("up_t").unwrap()
+            .scan_all().unwrap().iter().map(|(id, _)| *id).collect();
+        assert_eq!(before_ids, after_ids, "原地修改不该改变行的物理位置");
+
+        match exec_sql(&mut db, &mut session, "SELECT age FROM up_t WHERE id = 1").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![vec!["21".to_string()]]),
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        // 原地修改不产生墓碑：直接数页里的活记录。
+        // 不能用 record_count()——catalog 的统计字段只在新页分配时写回，
+        // 单页表的 meta 永远是 0（既有缺陷，不是本次改动引入）
+        assert_eq!(db.open_table("up_t").unwrap().scan_all().unwrap().len(), 2);
+
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_update_grow_falls_back() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE ug_t (id INT PRIMARY KEY, name VARCHAR(20))").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO ug_t VALUES (1, 'Bob')").unwrap();
+
+        // 'Bob'(3) → 'Bobby'(5)：变长放不下 → 退化成删+插，结果必须仍正确
+        assert!(matches!(
+            exec_sql(&mut db, &mut session, "UPDATE ug_t SET name = 'Bobby' WHERE id = 1").unwrap(),
+            ResultSet::Affected(1)
+        ));
+        // 再改短 → 原地覆盖
+        assert!(matches!(
+            exec_sql(&mut db, &mut session, "UPDATE ug_t SET name = 'Bo' WHERE id = 1").unwrap(),
+            ResultSet::Affected(1)
+        ));
+
+        match exec_sql(&mut db, &mut session, "SELECT * FROM ug_t").unwrap() {
+            ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
+                assert_eq!(cells_all(&rows), vec![vec!["1".to_string(), "Bo".to_string()]]);
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    #[test]
+    fn test_e2e_update_rollback() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE ur_t (id INT PRIMARY KEY, age INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO ur_t VALUES (1, 20)").unwrap();
+
+        // 原地修改写的是物理 Update 日志，Undo 按 before image 写回
+        exec_sql(&mut db, &mut session, "BEGIN").unwrap();
+        exec_sql(&mut db, &mut session, "UPDATE ur_t SET age = 99 WHERE id = 1").unwrap();
+        match exec_sql(&mut db, &mut session, "SELECT age FROM ur_t").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![vec!["99".to_string()]]),
+            other => panic!("got {:?}", other),
+        }
+        exec_sql(&mut db, &mut session, "ROLLBACK").unwrap();
+
+        match exec_sql(&mut db, &mut session, "SELECT age FROM ur_t").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(cells_all(&rows), vec![vec!["20".to_string()]], "ROLLBACK 必须还原");
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = db.shutdown();
+    }
+
+    // ==================== 多库端到端 ====================
     // ==================== 多库端到端 ====================
 
     const MULTI_DIR: &str = "./data/test_multi";

@@ -300,16 +300,28 @@ impl Parser {
         }
 
         self.expect(&Token::Values)?;
-        self.expect(&Token::LParen)?;
-        let mut values = Vec::new();
+
+        // 一行 = 一组括号；组与组之间用逗号：
+        //   VALUES (1, 'a')            → 1 行
+        //   VALUES (1, 'a'), (2, 'b')  → 2 行
+        let mut rows = Vec::new();
         loop {
-            values.push(self.parse_primary()?);  // 数字、字符串、NULL 都算 primary
+            self.expect(&Token::LParen)?;
+            let mut values = Vec::new();
+            loop {
+                values.push(self.parse_primary()?);  // 数字、字符串、NULL 都算 primary
+                if self.peek() != &Token::Comma { break; }
+                self.advance();
+            }
+            self.expect(&Token::RParen)?;
+            rows.push(values);
+
+            // 逗号后面必须还有一组括号，否则交给 parse() 末尾的 Eof 校验报错
             if self.peek() != &Token::Comma { break; }
             self.advance();
         }
-        self.expect(&Token::RParen)?;
 
-        Ok(Statement::Insert { table, columns, values })
+        Ok(Statement::Insert { table, columns, rows })
     }
 
     fn parse_delete(&mut self) -> Result<Statement, String> {
@@ -320,15 +332,12 @@ impl Parser {
         Ok(Statement::Delete { table, filter })
     }
     fn parse_create(&mut self) -> Result<Statement, String> {
-        if self.peek_at(1) == &Token::User {
-            return self.parse_create_user();
-        }
-        if self.peek_at(1) == &Token::Database {
-            return self.parse_create_database();
-        }
-        self.parse_create_table()      // 它自己会 expect(Create)
+        // CREATE USER / CREATE DATABASE / CREATE VIEW 走各自的解析器
+        if self.peek_at(1) == &Token::User { return self.parse_create_user(); }
+        if self.peek_at(1) == &Token::Database { return self.parse_create_database(); }
+        if self.peek_at(1) == &Token::View { return self.parse_create_view(); }
+        self.parse_create_table()
     }
-
     /// 往前看 offset 格，不消费
     fn peek_at(&self, offset: usize) -> &Token {
         self.tokens.get(self.pos + offset).unwrap_or(&Token::Eof)
@@ -340,7 +349,15 @@ impl Parser {
         let name = self.expect_ident()?;
         Ok(Statement::CreateDatabase { name })
     }
-
+    fn parse_create_view(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Create)?;
+        self.expect(&Token::View)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::As)?;
+        // 视图定义就是一条 SELECT，直接复用现成的解析器
+        let query = self.parse_select()?;
+        Ok(Statement::CreateView { name, query: Box::new(query) })
+    }
     /// USE shop
     fn parse_use(&mut self) -> Result<Statement, String> {
         self.expect(&Token::Use)?;
@@ -624,6 +641,11 @@ impl Parser {
             Token::Number(n) => Ok(Expr::Literal(LitValue::Number(n))),
             Token::Str(s) => Ok(Expr::Literal(LitValue::Str(s))),
             Token::Null => Ok(Expr::Literal(LitValue::Null)),
+            Token::LParen => {
+                let inner = self.parse_expr_or()?;
+                self.expect(&Token::RParen)?;
+                Ok(inner)
+            }
             tok => Err(format!("unexpected token in expression: {:?}", tok)),
         }
     }
@@ -659,11 +681,155 @@ impl Parser {
         Ok(Statement::Login { name, password })
     }
 }
+/// `Statement::Select` → 可重新解析的 SQL 文本。
+/// 这是 parse_select 的逆运算：输入是 AST，输出是等价的 SQL。
+/// 视图定义用它落库，所以必须**语义保真**，而不只是"看起来像"。
+pub fn select_to_sql(s: &Statement) -> Result<String, String> {
+    // 穷尽解构：将来给 Select 加字段，这里会编译报错（E0027），而不是静默丢字段
+    let Statement::Select {
+        distinct, columns, table, joins, filter, group_by, having, order_by, limit,
+    } = s else {
+        return Err("view definition must be a SELECT".to_string());
+    };
+
+    let mut out = String::from("SELECT ");
+    if *distinct {
+        out.push_str("DISTINCT ");
+    }
+    let items: Vec<String> = columns.iter().map(select_item_to_sql).collect();
+    out.push_str(&items.join(", "));
+    out.push_str(" FROM ");
+    out.push_str(table);
+
+    for j in joins {
+        out.push_str(&format!(" JOIN {} ON {} = {}", j.table, j.left_col, j.right_col));
+    }
+    if let Some(f) = filter {
+        out.push_str(" WHERE ");
+        out.push_str(&expr_to_sql(f, 0)?);
+    }
+    if !group_by.is_empty() {
+        out.push_str(" GROUP BY ");
+        out.push_str(&group_by.join(", "));
+    }
+    if let Some(h) = having {
+        out.push_str(" HAVING ");
+        out.push_str(&expr_to_sql(h, 0)?);
+    }
+    if !order_by.is_empty() {
+        let mut parts = Vec::with_capacity(order_by.len());
+        for o in order_by {
+            let e = expr_to_sql(&o.expr, 0)?;
+            parts.push(if o.asc { e } else { format!("{} DESC", e) });
+        }
+        out.push_str(" ORDER BY ");
+        out.push_str(&parts.join(", "));
+    }
+    if let Some(n) = limit {
+        out.push_str(&format!(" LIMIT {}", n));
+    }
+    Ok(out)
+}
+
+fn select_item_to_sql(item: &SelectItem) -> String {
+    match item {
+        SelectItem::Star => "*".to_string(),
+        SelectItem::Column(c) => c.clone(),
+        SelectItem::TableColumn { table, col } => format!("{}.{}", table, col),
+        SelectItem::Aggregate { func, column } => format!("{}({})", agg_to_sql(func), column),
+    }
+}
+
+fn agg_to_sql(f: &AggFunc) -> &'static str {
+    match f {
+        AggFunc::Sum => "SUM",
+        AggFunc::Count => "COUNT",
+        AggFunc::Avg => "AVG",
+        AggFunc::Min => "MIN",
+        AggFunc::Max => "MAX",
+    }
+}
+
+/// 表达式 → SQL 文本。
+/// 规则：**除了最外层，一律加括号**。牺牲可读性换"永远不用推理运算符优先级"——
+/// 否则 `And(a, Or(b, c))` 会被打印成 `a AND b OR c`，重新解析后语义就变了。
+fn expr_to_sql(e: &Expr, depth: usize) -> Result<String, String> {
+    let s = match e {
+        Expr::Column(c) => c.clone(),
+        Expr::QualifiedColumn { table, col } => format!("{}.{}", table, col),
+        Expr::Literal(LitValue::Number(n)) => n.to_string(),
+        Expr::Literal(LitValue::Str(v)) => format!("'{}'", v.replace('\'', "''")),
+        Expr::Literal(LitValue::Null) => "NULL".to_string(),
+        Expr::BinOp { left, op, right } => {
+            let o = match op {
+                BinOp::Eq => "=", BinOp::Neq => "!=",
+                BinOp::Lt => "<", BinOp::Le => "<=",
+                BinOp::Gt => ">", BinOp::Ge => ">=",
+            };
+            format!("{} {} {}", expr_to_sql(left, depth + 1)?, o, expr_to_sql(right, depth + 1)?)
+        }
+        Expr::And(l, r) => format!("{} AND {}", expr_to_sql(l, depth + 1)?, expr_to_sql(r, depth + 1)?),
+        Expr::Or(l, r) => format!("{} OR {}", expr_to_sql(l, depth + 1)?, expr_to_sql(r, depth + 1)?),
+        Expr::Like { expr, pattern } => {
+            format!("{} LIKE '{}'", expr_to_sql(expr, depth + 1)?, pattern.replace('\'', "''"))
+        }
+        Expr::IsNull { expr, negated } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("{} IS {}NULL", expr_to_sql(expr, depth + 1)?, not)
+        }
+        Expr::Not(inner) => format!("NOT {}", expr_to_sql(inner, depth + 1)?),
+        Expr::Aggregate { func, column } => format!("{}({})", agg_to_sql(func), column),
+    };
+    Ok(if depth > 0 { format!("({})", s) } else { s })
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::lexer::Lexer;
+    /// 往返判据：序列化结果重新解析后，AST 必须与原 AST 完全相等。
+    /// 不比较字符串——规范化后的文本本来就和原文不同。
+    fn assert_roundtrip(sql: &str) {
+        let s1 = parse_sql(sql).expect("原 SQL 解析失败");
+        let text = select_to_sql(&s1).expect("序列化失败");
+        let s2 = parse_sql(&text)
+            .unwrap_or_else(|e| panic!("序列化结果无法重新解析: {}\n{}", text, e));
+        assert_eq!(s1, s2, "序列化丢了语义，输出为: {}", text);
+    }
+
+    #[test]
+    fn test_select_to_sql_roundtrip() {
+        let cases = [
+            "SELECT * FROM t",
+            "SELECT id, name FROM t",
+            "SELECT DISTINCT id FROM t",
+            "SELECT * FROM t WHERE a > 1 AND b = 2",
+            "SELECT * FROM t WHERE (a > 1 OR b < 2) AND c = 3",
+            "SELECT * FROM t WHERE NOT (a = 1 AND b = 2)",
+            "SELECT * FROM t WHERE name LIKE 'A%' OR name IS NULL",
+            "SELECT * FROM t WHERE name IS NOT NULL",
+            "SELECT * FROM t WHERE name = 'it''s ok'",
+            "SELECT u.id, o.amount FROM u JOIN o ON u.id = o.uid",
+            "SELECT dept, SUM(amount) FROM t GROUP BY dept HAVING SUM(amount) > 100",
+            "SELECT * FROM t ORDER BY a DESC, b ASC LIMIT 5",
+            "SELECT COUNT(*) FROM t",
+        ];
+        for sql in cases {
+            assert_roundtrip(sql);
+        }
+    }
+
+    #[test]
+    fn test_create_view_parses() {
+        let s = parse_sql("CREATE VIEW v AS SELECT id, name FROM t WHERE id > 1").unwrap();
+        match s {
+            Statement::CreateView { name, query } => {
+                assert_eq!(name, "v");
+                assert!(matches!(*query, Statement::Select { .. }));
+            }
+            other => panic!("expected CreateView, got {:?}", other),
+        }
+    }
 
     fn parse_sql(sql: &str) -> Result<Statement, String> {
         let tokens = Lexer::new(sql).tokenize()?;
@@ -811,13 +977,14 @@ mod tests {
     #[test] fn test_insert_full() {
         let s = parse_sql("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
         match s {
-            Statement::Insert { table, columns, values } => {
+            Statement::Insert { table, columns, rows } => {
                 assert_eq!(table, "users");
                 assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
-                assert_eq!(values, vec![
+                // 单行插入 = 只有一组的 rows
+                assert_eq!(rows, vec![vec![
                     Expr::Literal(LitValue::Number(1)),
                     Expr::Literal(LitValue::Str("Alice".to_string())),
-                ]);
+                ]]);
             }
             other => panic!("expected Insert, got {:?}", other),
         }
@@ -896,10 +1063,29 @@ mod tests {
     fn test_insert_null_value() {
         let s = parse_sql("INSERT INTO t (id, name) VALUES (1, NULL)").unwrap();
         match s {
-            Statement::Insert { values, .. } => {
-                assert_eq!(values, vec![
+            Statement::Insert { rows, .. } => {
+                assert_eq!(rows, vec![vec![
                     Expr::Literal(LitValue::Number(1)),
                     Expr::Literal(LitValue::Null),
+                ]]);
+            }
+            other => panic!("expected Insert, got {:?}", other),
+        }
+    }
+    #[test]
+    fn test_insert_multi_row_parses() {
+        let s = parse_sql("INSERT INTO t (id, name) VALUES (1, 'A'), (2, 'B')").unwrap();
+        match s {
+            Statement::Insert { columns, rows, .. } => {
+                assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
+                assert_eq!(rows.len(), 2, "只有一个逗号却切出了 {} 行", rows.len());
+                assert_eq!(rows[0], vec![
+                    Expr::Literal(LitValue::Number(1)),
+                    Expr::Literal(LitValue::Str("A".to_string())),
+                ]);
+                assert_eq!(rows[1], vec![
+                    Expr::Literal(LitValue::Number(2)),
+                    Expr::Literal(LitValue::Str("B".to_string())),
                 ]);
             }
             other => panic!("expected Insert, got {:?}", other),

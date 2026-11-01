@@ -13,10 +13,13 @@ pub enum Statement {
         name: String,
     },
     /// INSERT INTO users (id, name) VALUES (1, 'Alice')
+    /// INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')
     Insert {
         table: String,
         columns: Vec<String>,       // 空 = 全列
-        values: Vec<Expr>,
+        /// 外层 = 行，内层 = 这一行的值。
+        /// 单行插入就是 `rows.len() == 1`，不额外设变体。
+        rows: Vec<Vec<Expr>>,
     },
     /// SELECT name, age FROM users WHERE age > 18
     Select {
@@ -59,6 +62,9 @@ pub enum Statement {
     CreateDatabase { name: String },
     /// USE shop —— 切换本会话的当前库（不是全局！）
     Use { name: String },
+    /// CREATE VIEW v AS SELECT ...
+    /// query 必须是 Statement::Select（Box 是必须的：枚举递归自引用，不加会报 E0072）
+    CreateView { name: String, query: Box<Statement> },
 }
 
 /// SELECT 列表里的每一项
