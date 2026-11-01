@@ -878,6 +878,7 @@ impl Table {
         }
     }
 
+    /// 扫描表内所有记录
     pub fn scan_all(&self) -> std::io::Result<Vec<(RowId, Record)>> {
         let mut results = Vec::new();
         for &page_id in &self.data_pages {

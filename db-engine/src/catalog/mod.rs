@@ -521,22 +521,24 @@ mod tests {
     use crate::storage::disk_manager::DiskManager;
     use crate::recovery::log_manager::LogManager;
 
-    fn setup() -> (Arc<BufferPool>, FreePageManager) {
-        let test_file = "./data/test_catalog.db";
-        let _ = std::fs::remove_file(test_file);
+    // 每个测试用自己的文件：测试默认并行跑，共用一个固定文件名时
+    // 一个测试的 remove_file 会删掉另一个正在写的文件，报 PermissionDenied
+    fn setup(tag: &str) -> (Arc<BufferPool>, FreePageManager) {
+        let test_file = format!("./data/test_catalog_{}.db", tag);
+        let _ = std::fs::remove_file(&test_file);
         std::fs::create_dir_all("./data").unwrap();
 
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(test_file)
+            .open(&test_file)
             .unwrap();
 
         let dm = DiskManager::from_file(file);
-        let test_log = "./data/test_catalog.log";
-        let _ = std::fs::remove_file(test_log);
-        let lm = Arc::new(LogManager::from_path(test_log).unwrap());
+        let test_log = format!("./data/test_catalog_{}.log", tag);
+        let _ = std::fs::remove_file(&test_log);
+        let lm = Arc::new(LogManager::from_path(&test_log).unwrap());
         let bp = Arc::new(BufferPool::new(dm, lm));
 
         // 预分配足够的页（支持多页 Catalog 扩展）
@@ -554,7 +556,7 @@ mod tests {
 
     #[test]
     fn test_create_and_list_tables() {
-        let (bp, mut fpm) = setup();
+        let (bp, mut fpm) = setup("create_list");
         let mut catalog = Catalog::new(bp);
 
         let cols = vec![
@@ -575,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_table_rejected() {
-        let (bp, mut fpm) = setup();
+        let (bp, mut fpm) = setup("dup");
         let mut catalog = Catalog::new(bp);
 
         let cols = vec![Column::int("id")];
@@ -586,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_drop_table() {
-        let (bp, mut fpm) = setup();
+        let (bp, mut fpm) = setup("drop");
         let mut catalog = Catalog::new(bp);
 
         let cols = vec![Column::int("id")];
@@ -599,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_persistence_roundtrip() {
-        let (bp, mut fpm) = setup();
+        let (bp, mut fpm) = setup("persist");
         let mut catalog = Catalog::new(bp.clone());
 
         let cols = vec![
@@ -619,7 +621,7 @@ mod tests {
     }
     #[test]
     fn test_multi_page_catalog() {
-        let (bp, mut fpm) = setup();
+        let (bp, mut fpm) = setup("multipage");
         let mut catalog = Catalog::new(bp.clone());
 
         // 创建大量表以触发多页扩展

@@ -31,6 +31,9 @@ pub struct Session {
     pub peer_is_local: bool,
     /// 当前库名；None = 启动时打开的默认库
     pub current_db: Option<String>,
+    /// DROP DATABASE 的延迟意图：execute 只登记，由 server 在锁内真正删。
+    /// 为什么不在这里删：execute 手里只有一个库，看不到 registry，也借不到它。
+    pub pending_drop_db: Option<String>,
 }
 
 fn ast_col_to_column(def: ColumnDef) -> Column {
@@ -155,7 +158,7 @@ fn execute_create_table(name: String, columns: Vec<ColumnDef>, db: &mut Database
 
 impl Session {
     pub fn new() -> Self {
-        Self { txn_id: None, user: None, peer_is_local: true, current_db: None }
+        Self { txn_id: None, user: None, peer_is_local: true, current_db: None, pending_drop_db: None }
     }
 }
 // ==================== 访问控制：内部表 ====================
@@ -606,6 +609,28 @@ fn execute_use(name: String, db: &Database, session: &mut Session) -> Result<Res
     session.current_db = Some(name);
     Ok(ResultSet::Ok)
 }
+/// DROP DATABASE shop —— 只做校验和登记，真正的删除在 DbRegistry。
+fn execute_drop_database(name: String, session: &mut Session) -> Result<ResultSet, String> {
+    // ① 事务内禁止：undo 日志就在被删库的 .log 里，删掉就无法回滚
+    if session.txn_id.is_some() {
+        return Err("DROP DATABASE is not allowed inside a transaction".into());
+    }
+    // ② 不能删自己正在用的库：删完本次会话的每次请求都会 resolve 失败
+    if session.current_db.as_deref() == Some(name.as_str()) {
+        return Err("cannot drop the database you are using; USE another database first".into());
+    }
+    // ③ 名字合法性在这一层先挡一次（registry 会再验一次，双保险）
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Err(format!("invalid database name '{}'", name));
+    }
+    if name.starts_with(INTERNAL_PREFIX) {
+        return Err(format!("database name '{}' is reserved", name));
+    }
+
+    // ④ 只登记意图。此刻不碰任何文件 —— 我们连 root 在哪都不知道
+    session.pending_drop_db = Some(name);
+    Ok(ResultSet::Ok)
+}
 // ==================== 访问控制：唯一闸门 ====================
 
 fn user_count(db: &Database) -> Result<usize, String> {
@@ -677,8 +702,17 @@ fn authorize(
         | Statement::Grant { .. } | Statement::Revoke { .. }
         // 建库 / 建视图 / 删视图：名字都不是表名，走「admin required」
         | Statement::CreateDatabase { .. }
+        | Statement::DropDatabase { .. } => None,
         | Statement::CreateView { .. }
         | Statement::DropView { .. } => None,
+        // 元数据查询不落在任何一张表上
+        Statement::ShowTables => None,
+        // 看表结构只读元数据，有 SELECT 权限即可（内部表由 ⑤ 拦）
+        Statement::DescribeTable { .. } => Some(Priv::Select),
+        // 清表等于删全部行，所以按 DELETE 权限判，不另造一个 TRUNCATE 权限
+        Statement::TruncateTable { .. } => Some(Priv::Delete),
+        // 改列定义是 DDL：没有"表级权限"这一说，只给 admin
+        Statement::AlterTable { .. } => None,
 
 
     };
@@ -694,7 +728,12 @@ fn authorize(
         | Statement::Begin | Statement::Commit | Statement::Rollback
         // 库名 / 视图名 / 用户名都不是表名，不能塞进 touched
         | Statement::CreateView { .. } | Statement::DropView { .. } => None,
+        | Statement::DropDatabase { .. } => None,
         | Statement::CreateDatabase { .. } | Statement::Use { .. } => None,
+        Statement::ShowTables => None,
+        Statement::DescribeTable { name } => Some(name),
+        Statement::TruncateTable { name } => Some(name),
+        Statement::AlterTable { table, .. } => Some(table),
     };
 
     // ③ bootstrap：库里一个用户都没有 → 只有本地连接可以不设防。
@@ -929,6 +968,7 @@ pub fn execute(
             session.txn_id = None;
             Ok(ResultSet::Ok)
         }
+        Statement::DropDatabase { name } => execute_drop_database(name, session),
         Statement::DropView { name } => execute_drop_view(name, db, session),
         Statement::Update { table, assignments, filter } => execute_update(table, assignments, filter, db, session),
         Statement::CreateUser { name, password } => {
@@ -953,8 +993,178 @@ pub fn execute(
         Statement::Use { name } => execute_use(name, db, session),
         // Step 3 接入真正的实现，先占位保证编译
         Statement::CreateView { name, query } => execute_create_view(name, *query, db, session),
+        Statement::ShowTables => execute_show_tables(db),
+        Statement::DescribeTable { name } => execute_describe(name, db),
+        Statement::TruncateTable { name } => execute_truncate(name, db, session),
+        Statement::AlterTable { table, action } => execute_alter_table(table, action, db),
     }
     }
+
+
+/// ALTER TABLE 的元数据子集：只改 Column 描述，一页数据都不碰。
+/// 改列名只影响名字——行是按位置编码的，字节布局与列名无关，所以不必重写数据。
+fn execute_alter_table(
+    table: String,
+    action: AlterAction,
+    db: &mut Database,
+) -> Result<ResultSet, String> {
+    let Some(meta) = db.get_table_meta(&table) else {
+        // 视图的列名是建视图那一刻的快照，没有可改的定义；给出明确指引而不是"表不存在"
+        if load_view(db, &table)?.is_some() {
+            return Err(format!("'{}' is a view, ALTER is not supported on views", table));
+        }
+        return Err(format!("table '{}' does not exist", table));
+    };
+    let mut cols: Vec<Column> = meta.columns.clone();
+
+    let idx_of = |cols: &Vec<Column>, col: &str| -> Result<usize, String> {
+        cols.iter()
+            .position(|c| c.name == col)
+            .ok_or_else(|| format!("column '{}' not found in table '{}'", col, table))
+    };
+
+    match action {
+        AlterAction::RenameColumn { from, to } => {
+            let idx = idx_of(&cols, &from)?;
+            if cols.iter().any(|c| c.name == to) {
+                return Err(format!("column '{}' already exists", to));
+            }
+            cols[idx].name = to;
+        }
+        AlterAction::SetDefault { column, value } => {
+            let idx = idx_of(&cols, &column)?;
+            cols[idx].default_value = match value {
+                // 与 CREATE TABLE 的 DEFAULT 保持同一套映射，两处行为不能分叉
+                LitValue::Number(n) => Some(DefaultVal::Int(n as u32)),
+                LitValue::Str(s) => Some(DefaultVal::Varchar(s)),
+                LitValue::Null => None,
+            };
+        }
+        AlterAction::DropDefault { column } => {
+            let idx = idx_of(&cols, &column)?;
+            cols[idx].default_value = None;
+        }
+    }
+
+    db.alter_columns(&table, &cols)
+        .map_err(|e| format!("alter_table failed: {}", e))?;
+    Ok(ResultSet::Ok)
+}
+
+
+/// TRUNCATE TABLE t —— 逐行打墓碑，不做"直接释放页"。
+/// 释放页不会进 WAL，崩溃后 catalog 里的页列表会和实际数据对不上；
+/// 逐行删是本引擎唯一被验证过可回滚的路径（BEGIN; TRUNCATE; ROLLBACK 能复原）。
+/// 先把 RowId 全收集再删：scan_all 期间改动页会让未读到的槽位错位。
+fn execute_truncate(
+    name: String,
+    db: &mut Database,
+    session: &mut Session,
+) -> Result<ResultSet, String> {
+    let mut table = match db.open_table(&name) {
+        Ok(t) => t,
+        Err(e) => {
+            // 视图没有物理行；报错时直接给出可照抄的替代语句
+            if load_view(db, &name)?.is_some() {
+                return Err(format!("'{}' is a view, use DELETE FROM {}", name, name));
+            }
+            return Err(format!("open_table failed: {}", e));
+        }
+    };
+
+    let rids: Vec<RowId> = table
+        .scan_all()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(rid, _)| rid)
+        .collect();
+
+    let mut deleted = 0usize;
+    for rid in rids {
+        table
+            .delete(rid, db.txn_mgr(), session.txn_id)
+            .map_err(|e| format!("delete failed: {}", e))?;
+        deleted += 1;
+    }
+    Ok(ResultSet::Affected(deleted))
+}
+
+
+/// DESCRIBE t —— 纯元数据视图，不碰任何数据页。
+/// 视图没有物理列定义，只能拿建视图那一刻的列名快照，
+/// 所以 type 写 "VIEW"、其余约束列留空串：那是「未知」，不是「否」。
+/// 六列统一用空串而非 NULL，是为了让前端对「视图的约束列」只有一种展示口径。
+/// 普通表的 default 缺失则必须是 None（真 NULL），否则和「DEFAULT ''」混淆。
+fn execute_describe(name: String, db: &Database) -> Result<ResultSet, String> {
+    let columns = vec![
+        "column".to_string(), "type".to_string(), "nullable".to_string(),
+        "default".to_string(), "primary_key".to_string(), "unique".to_string(),
+    ];
+
+    if let Some(meta) = db.get_table_meta(&name) {
+        let rows = meta
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = match c.col_type {
+                    ColumnType::Int => "INT".to_string(),
+                    ColumnType::Varchar(n) => format!("VARCHAR({})", n),
+                };
+                let default = match &c.default_value {
+                    Some(DefaultVal::Int(n)) => Some(n.to_string()),
+                    Some(DefaultVal::Varchar(s)) => Some(s.clone()),
+                    None => None,
+                };
+                vec![
+                    Some(c.name.clone()),
+                    Some(ty),
+                    Some(if c.nullable { "1" } else { "0" }.to_string()),
+                    default,
+                    Some(if c.primary_key { "1" } else { "0" }.to_string()),
+                    Some(if c.unique { "1" } else { "0" }.to_string()),
+                ]
+            })
+            .collect();
+        return Ok(ResultSet::Rows { columns, rows });
+    }
+
+    if let Some(v) = load_view(db, &name)? {
+        let rows = v
+            .columns
+            .iter()
+            .map(|c| {
+                vec![
+                    Some(c.clone()),
+                    Some("VIEW".to_string()),
+                    Some(String::new()),
+                    Some(String::new()),
+                    Some(String::new()),
+                    Some(String::new()),
+                ]
+            })
+            .collect();
+        return Ok(ResultSet::Rows { columns, rows });
+    }
+
+    Err(format!("table '{}' does not exist", name))
+}
+
+
+/// SHOW TABLES —— 只列用户表。
+/// 内部表（__minidb_users / __minidb_views）是引擎自己的元数据，
+/// 列出来等于把账号表的存在告诉普通用户，所以一律过滤。
+/// 排序是必要的：catalog 底层是 HashMap，不排序的话每次启动顺序都可能不同。
+fn execute_show_tables(db: &Database) -> Result<ResultSet, String> {
+    let mut names: Vec<String> = db
+        .list_tables()
+        .into_iter()
+        .filter(|n| !n.starts_with(INTERNAL_PREFIX))
+        .map(|n| n.to_string())
+        .collect();
+    names.sort();
+    let rows = names.into_iter().map(|n| vec![Some(n)]).collect();
+    Ok(ResultSet::Rows { columns: vec!["table".into()], rows })
+}
 
 
 fn execute_create_view(
@@ -2093,6 +2303,161 @@ mod tests {
     /// 整个结果集 → String（NULL 显示为 "NULL"）
     fn cells_all(rows: &[Vec<Option<String>>]) -> Vec<Vec<String>> {
         rows.iter().map(|r| cells(r)).collect()
+    }
+
+    #[test]
+    fn test_e2e_show_tables() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE st_a (id INT PRIMARY KEY)").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE TABLE st_b (id INT PRIMARY KEY)").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE VIEW st_v AS SELECT id FROM st_a").unwrap();
+        // 这一条会连带建出 __minidb_users，是内部表泄漏的第一现场
+        exec_sql(&mut db, &mut session, "CREATE USER st_admin PASSWORD 'pw'").unwrap();
+        // 有用户之后匿名一律拒绝，不登录根本看不到结果
+        exec_sql(&mut db, &mut session, "LOGIN st_admin PASSWORD 'pw'").unwrap();
+
+        let r = exec_sql(&mut db, &mut session, "SHOW TABLES").unwrap();
+        let ResultSet::Rows { columns, rows } = r else {
+            panic!("SHOW TABLES 必须返回结果集");
+        };
+        assert_eq!(columns, vec!["table".to_string()]);
+        assert_eq!(
+            cells_all(&rows),
+            vec![vec!["st_a".to_string()], vec!["st_b".to_string()]]
+        );
+        for row in &rows {
+            let name = cell(&row[0]);
+            assert!(!name.starts_with("__minidb_"), "内部表泄漏：{}", name);
+            assert_ne!(name, "st_v", "视图不是表，不该出现在 SHOW TABLES");
+        }
+    }
+
+    #[test]
+    fn test_e2e_describe() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(
+            &mut db,
+            &mut session,
+            "CREATE TABLE d_t (id INT PRIMARY KEY, name VARCHAR(32) NOT NULL UNIQUE, age INT DEFAULT 18)",
+        )
+        .unwrap();
+
+        let r = exec_sql(&mut db, &mut session, "DESCRIBE d_t").unwrap();
+        let ResultSet::Rows { columns, rows } = r else {
+            panic!("DESCRIBE 必须返回结果集");
+        };
+        assert_eq!(
+            columns,
+            vec!["column", "type", "nullable", "default", "primary_key", "unique"]
+                .into_iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(rows.len(), 3);
+
+        // 主键列：nullable 必须是 0（primary_key() 里强制），unique 也必须是 1
+        assert_eq!(cells(&rows[0]), vec!["id", "INT", "0", "NULL", "1", "1"]);
+        assert_eq!(cells(&rows[1]), vec!["name", "VARCHAR(32)", "0", "NULL", "0", "1"]);
+        assert_eq!(cells(&rows[2]), vec!["age", "INT", "1", "18", "0", "0"]);
+
+        assert_err_contains(
+            exec_sql(&mut db, &mut session, "DESCRIBE nosuch"),
+            "does not exist",
+        );
+    }
+
+    #[test]
+    fn test_e2e_truncate() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session, "CREATE TABLE tr_t (id INT PRIMARY KEY)").unwrap();
+        for i in 1..=3 {
+            exec_sql(&mut db, &mut session, &format!("INSERT INTO tr_t VALUES ({})", i)).unwrap();
+        }
+
+        // ① 普通清表：行数要如实报出来，不能固定返回 0
+        match exec_sql(&mut db, &mut session, "TRUNCATE TABLE tr_t").unwrap() {
+            ResultSet::Affected(n) => assert_eq!(n, 3),
+            other => panic!("TRUNCATE 应返回受影响行数，实际 {:?}", other),
+        }
+        let r = exec_sql(&mut db, &mut session, "SELECT * FROM tr_t").unwrap();
+        let ResultSet::Rows { rows, .. } = r else { panic!("SELECT 应返回结果集") };
+        assert_eq!(rows.len(), 0, "清表后不应有残留行");
+
+        // ② 回滚语义：这是 TRUNCATE 走逐行 delete 的唯一理由
+        for i in 1..=3 {
+            exec_sql(&mut db, &mut session, &format!("INSERT INTO tr_t VALUES ({})", i)).unwrap();
+        }
+        exec_sql(&mut db, &mut session, "BEGIN").unwrap();
+        match exec_sql(&mut db, &mut session, "TRUNCATE TABLE tr_t").unwrap() {
+            ResultSet::Affected(n) => assert_eq!(n, 3),
+            other => panic!("事务内 TRUNCATE 也应返回行数，实际 {:?}", other),
+        }
+        exec_sql(&mut db, &mut session, "ROLLBACK").unwrap();
+
+        let r = exec_sql(&mut db, &mut session, "SELECT * FROM tr_t").unwrap();
+        let ResultSet::Rows { rows, .. } = r else { panic!("SELECT 应返回结果集") };
+        assert_eq!(rows.len(), 3, "ROLLBACK 后 3 行必须全部回来");
+    }
+
+    #[test]
+    fn test_e2e_alter_table() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(
+            &mut db,
+            &mut session,
+            "CREATE TABLE a_t (id INT PRIMARY KEY, name VARCHAR(20), age INT)",
+        )
+        .unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO a_t VALUES (1, 'Alice', 20)").unwrap();
+
+        // ① 改列名：行是按位置存的，改名不能把数据弄丢
+        exec_sql(&mut db, &mut session, "ALTER TABLE a_t RENAME COLUMN name TO full_name").unwrap();
+        let r = exec_sql(&mut db, &mut session, "SELECT full_name FROM a_t").unwrap();
+        let ResultSet::Rows { rows, .. } = r else { panic!("SELECT 应返回结果集") };
+        assert_eq!(cells_all(&rows), vec![vec!["Alice".to_string()]]);
+        // 旧名必须立刻失效，否则等于留了一个幽灵列
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT name FROM a_t"), "not found");
+
+        // ② 设默认值 / 删默认值，效果从 DESCRIBE 读
+        exec_sql(&mut db, &mut session, "ALTER TABLE a_t SET DEFAULT age = 30").unwrap();
+        let r = exec_sql(&mut db, &mut session, "DESCRIBE a_t").unwrap();
+        let ResultSet::Rows { rows, .. } = r else { panic!("DESCRIBE 应返回结果集") };
+        assert_eq!(cell(&rows[2][3]), "30");
+
+        exec_sql(&mut db, &mut session, "ALTER TABLE a_t DROP DEFAULT age").unwrap();
+        let r = exec_sql(&mut db, &mut session, "DESCRIBE a_t").unwrap();
+        let ResultSet::Rows { rows, .. } = r else { panic!("DESCRIBE 应返回结果集") };
+        assert_eq!(rows[2][3], None, "删默认值后必须是 NULL，不能是空串");
+
+        // ③ 未实现的形态必须显式拒绝，不能被静默接受
+        assert_err_contains(
+            exec_sql(&mut db, &mut session, "ALTER TABLE a_t ADD COLUMN x INT"),
+            "not supported yet",
+        );
+        assert_err_contains(
+            exec_sql(&mut db, &mut session, "ALTER TABLE a_t RENAME TO b_t"),
+            "not supported yet",
+        );
+        assert_err_contains(
+            exec_sql(&mut db, &mut session, "ALTER TABLE a_t DROP COLUMN age"),
+            "not supported yet",
+        );
+
+        // ④ 不存在的表
+        assert_err_contains(
+            exec_sql(&mut db, &mut session, "ALTER TABLE nosuch RENAME COLUMN a TO b"),
+            "does not exist",
+        );
     }
 
     #[test]
@@ -3863,6 +4228,30 @@ mod tests {
         exec_sql(&mut db, &mut session, "CREATE VIEW dv_v2 AS SELECT id FROM dv_t").unwrap();
         assert_err_contains(exec_sql(&mut db, &mut session, "DROP TABLE dv_v2"),
                             "use DROP VIEW");
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_drop_database_intent() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        // ① 事务内拒绝
+        exec_sql(&mut db, &mut session, "BEGIN").unwrap();
+        assert_err_contains(exec_sql(&mut db, &mut session, "DROP DATABASE ddx"),
+                            "inside a transaction");
+        exec_sql(&mut db, &mut session, "ROLLBACK").unwrap();
+
+        // ② 当前库拒绝
+        session.current_db = Some("test_executor".to_string());
+        assert_err_contains(exec_sql(&mut db, &mut session, "DROP DATABASE test_executor"),
+                            "cannot drop the database you are using");
+        session.current_db = None;
+
+        // ③ 正常：只登记意图，不碰文件
+        exec_sql(&mut db, &mut session, "DROP DATABASE ddx").unwrap();
+        assert_eq!(session.pending_drop_db.as_deref(), Some("ddx"));
 
         let _ = db.shutdown();
     }

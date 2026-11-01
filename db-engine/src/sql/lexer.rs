@@ -147,6 +147,13 @@ impl Lexer {
                     "DATABASE" => Ok(Token::Database),
                     "USE" => Ok(Token::Use),
                     "VIEW" => Ok(Token::View),
+                    "SHOW" => Ok(Token::Show),
+                    "TABLES" => Ok(Token::Tables),
+                    "DESCRIBE" => Ok(Token::Describe),
+                    "TRUNCATE" => Ok(Token::Truncate),
+                    "ALTER" => Ok(Token::Alter),
+                    "RENAME" => Ok(Token::Rename),
+                    "COLUMN" => Ok(Token::Column),
                     _ => Ok(Token::Ident(s)),
                 }
 
@@ -274,6 +281,50 @@ mod tests {
                 Token::And,
                 Token::Ident("name".into()), Token::Like, Token::Str("%张%".into()),
                 Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn test_show_keyword() {
+        // SHOW TABLES 是两条独立关键字，不能退化成 Ident
+        assert_eq!(
+            tokens("SHOW TABLES"),
+            vec![Token::Show, Token::Tables, Token::Eof]
+        );
+        // 表名恰好在别的语句里叫 tables 也不会被误伤：这里只验证识别方向
+        assert_eq!(
+            tokens("show tables"),
+            vec![Token::Show, Token::Tables, Token::Eof]
+        );
+    }
+
+    #[test]
+    fn test_describe_keyword() {
+        assert_eq!(
+            tokens("DESCRIBE t"),
+            vec![Token::Describe, Token::Ident("t".into()), Token::Eof]
+        );
+        // DESC 必须仍然是排序方向：DESCRIBE 不能被前缀吃成 DESC + RIBE
+        assert_eq!(tokens("DESC"), vec![Token::Desc, Token::Eof]);
+    }
+
+    #[test]
+    fn test_truncate_keyword() {
+        assert_eq!(
+            tokens("TRUNCATE TABLE t"),
+            vec![Token::Truncate, Token::Table, Token::Ident("t".into()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn test_alter_keyword() {
+        assert_eq!(
+            tokens("ALTER TABLE t RENAME COLUMN a TO b"),
+            vec![
+                Token::Alter, Token::Table, Token::Ident("t".into()),
+                Token::Rename, Token::Column, Token::Ident("a".into()),
+                Token::To, Token::Ident("b".into()), Token::Eof
             ]
         );
     }

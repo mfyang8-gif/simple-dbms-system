@@ -26,6 +26,15 @@ pub enum Token {
     // 视图：CREATE VIEW v AS SELECT ...
     View,
 
+    // 元数据查询：SHOW TABLES
+    Show, Tables,
+    // 表结构：DESCRIBE t（不提供 DESC 别名，会和 ORDER BY DESC 撞）
+    Describe,
+    // 清表：TRUNCATE TABLE t
+    Truncate,
+    // 改表结构（只做元数据子集）：ALTER TABLE t RENAME COLUMN a TO b
+    Alter, Rename, Column,
+
     // ===== 标识符与字面量 =====
     Ident(String),       // 表名、列名等用户自定义名
     Number(i64),         // 整数字面量

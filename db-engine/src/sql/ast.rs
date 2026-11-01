@@ -71,11 +71,32 @@ pub enum Statement {
     Revoke { privs: Vec<Priv>, table: String, user: String },
     /// CREATE DATABASE shop
     CreateDatabase { name: String },
+    /// DROP DATABASE shop
+    DropDatabase {
+        name: String,
+    },
     /// USE shop —— 切换本会话的当前库（不是全局！）
     Use { name: String },
     /// CREATE VIEW v AS SELECT ...
     /// query 必须是 Statement::Select（Box 是必须的：枚举递归自引用，不加会报 E0072）
     CreateView { name: String, query: Box<Statement> },
+    /// SHOW TABLES
+    ShowTables,
+    /// DESCRIBE t —— 列与视图共用，执行期再区分
+    DescribeTable { name: String },
+    /// TRUNCATE TABLE t —— 语义上等价于无 WHERE 的 DELETE，不重置自增计数
+    TruncateTable { name: String },
+    /// ALTER TABLE t ... —— 只覆盖"改元数据"的三种形态，其余在执行/解析期拒绝
+    AlterTable { table: String, action: AlterAction },
+}
+
+/// ALTER TABLE 的动作。只做不需要动数据的三种：
+/// 改列名、设默认值、删默认值——它们都不碰已有行的字节布局。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    RenameColumn { from: String, to: String },
+    SetDefault { column: String, value: LitValue },
+    DropDefault { column: String },
 }
 
 /// SELECT 列表里的每一项

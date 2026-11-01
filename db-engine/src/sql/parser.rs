@@ -39,6 +39,10 @@ impl Parser {
             Token::Revoke  => self.parse_revoke(),   // ← 新增
             Token::Login   => self.parse_login(),    // ← 新增
             Token::Use     => self.parse_use(),      // ← 新增
+            Token::Show    => self.parse_show(),     // ← 新增
+            Token::Describe => self.parse_describe(), // ← 新增
+            Token::Truncate => self.parse_truncate(), // ← 新增
+            Token::Alter   => self.parse_alter_table(), // ← 新增
             Token::Rollback => { self.advance(); Ok(Statement::Rollback) }
             tok => Err(format!("expected statement keyword, got {:?}", tok)),
         }
@@ -364,6 +368,81 @@ impl Parser {
         let name = self.expect_ident()?;
         Ok(Statement::Use { name })
     }
+
+    /// SHOW TABLES —— 目前只有一个合法形态，出现别的尾巴就当语法错误，
+    /// 免得 `SHOW TABLES xyz` 被静默接受。
+    fn parse_show(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Show)?;
+        self.expect(&Token::Tables)?;
+        Ok(Statement::ShowTables)
+    }
+
+    /// DESCRIBE t —— 目标可以是表也可以是视图，这里不做区分，
+    /// 免得解析期就要拿 catalog（parser 不依赖 Database）
+    fn parse_describe(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Describe)?;
+        let name = self.expect_ident()?;
+        Ok(Statement::DescribeTable { name })
+    }
+
+    /// TRUNCATE TABLE t —— TABLE 是保留字，必须显式吃掉，
+    /// 否则 `TRUNCATE t` 会被当成表 t 而静默通过（这里要求写全）
+    fn parse_truncate(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Truncate)?;
+        self.expect(&Token::Table)?;
+        let name = self.expect_ident()?;
+        Ok(Statement::TruncateTable { name })
+    }
+
+    /// 只接受一个字面量（数字 / 字符串 / NULL）
+    fn parse_literal(&mut self) -> Result<LitValue, String> {
+        match self.advance() {
+            Token::Number(n) => Ok(LitValue::Number(n)),
+            Token::Str(s) => Ok(LitValue::Str(s)),
+            Token::Null => Ok(LitValue::Null),
+            tok => Err(format!("expected literal, got {:?}", tok)),
+        }
+    }
+
+    /// ALTER TABLE t ... —— 只支持三种元数据形态。
+    /// 其余形态（ADD/DROP COLUMN、RENAME TO、SET/DROP NOT NULL）一律明确回
+    /// "not supported yet"：被静默接受比被拒绝危险得多，用户会以为改动生效了。
+    fn parse_alter_table(&mut self) -> Result<Statement, String> {
+        self.expect(&Token::Alter)?;
+        self.expect(&Token::Table)?;
+        let table = self.expect_ident()?;
+
+        let action = match (self.peek().clone(), self.peek_at(1).clone()) {
+            (Token::Rename, Token::Column) => {
+                self.advance();
+                self.expect(&Token::Column)?;
+                let from = self.expect_ident()?;
+                self.expect(&Token::To)?;
+                let to = self.expect_ident()?;
+                AlterAction::RenameColumn { from, to }
+            }
+            (Token::Set, Token::Default) => {
+                self.advance();
+                self.expect(&Token::Default)?;
+                let column = self.expect_ident()?;
+                self.expect(&Token::Eq)?;
+                let value = self.parse_literal()?;
+                AlterAction::SetDefault { column, value }
+            }
+            (Token::Drop, Token::Default) => {
+                self.advance();
+                self.expect(&Token::Default)?;
+                let column = self.expect_ident()?;
+                AlterAction::DropDefault { column }
+            }
+            (tok, _) => {
+                return Err(format!(
+                    "ALTER TABLE form not supported yet (got {:?} after table name)", tok
+                ))
+            }
+        };
+        Ok(Statement::AlterTable { table, action })
+    }
     fn parse_create_table(&mut self) -> Result<Statement, String> {
         self.expect(&Token::Create)?;
         self.expect(&Token::Table)?;
@@ -440,6 +519,11 @@ impl Parser {
             self.advance();
             let name = self.expect_ident()?;
             return Ok(Statement::DropUser { name });
+        }
+        if self.peek() == &Token::Database {
+            self.advance();
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropDatabase { name });
         }
 
         self.expect(&Token::Table)?;

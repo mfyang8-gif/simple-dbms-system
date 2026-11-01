@@ -146,6 +146,16 @@ impl Database {
         Ok(())
     }
 
+    /// 改列定义（ALTER TABLE 的元数据子集用）。
+    /// 为什么不让调用方自己调 catalog.update_columns：catalog 与 free_mgr
+    /// 都得可变借用，分开取就是 E0499；回到 impl 里才能做字段级拆分。
+    pub fn alter_columns(&mut self, name: &str, columns: &[Column]) -> std::io::Result<()> {
+        self.catalog.update_columns(name, columns, &mut self.free_mgr)?;
+        // Catalog 页可能因列定义变长而扩页，页数统计必须跟着更新
+        self.sync_file_header()?;
+        Ok(())
+    }
+
     /// 获取一张可操作的表
     pub fn open_table(&self, name: &str) -> std::io::Result<Table> {
         self.catalog.open_table(name)
@@ -185,7 +195,7 @@ impl Database {
         self.log_manager.flush()?;
         Ok(())
     }
-    
+
 
     /// 获取内部组件引用（Table 的 insert/delete 需要用到）
     pub fn buffer_pool(&self) -> &Arc<BufferPool> { &self.buffer_pool }
@@ -272,5 +282,91 @@ impl DbRegistry {
             let _ = db.shutdown();
         }
         let _ = self.default_db.shutdown();
+    }
+    /// 真正删库：关句柄 → 删日志 → 删数据文件。
+    /// 调用方必须已经持有 registry 的独占借用，且不能再持有任何 &mut Database。
+    pub fn drop_db(&mut self, name: &str) -> Result<(), String> {
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(format!("invalid database name '{}'", name));
+        }
+        // 默认库同时是账号库：删了凭据全没；而且 default_db 是值字段，没有"空"的状态
+        if name == self.default_name {
+            return Err(format!("cannot drop the default database '{}'", name));
+        }
+
+        let db_file = self.root.join(format!("{}.db", name));
+        let log_file = self.root.join(format!("{}.log", name));
+
+        // 存在性只认文件，绝不 open_at 试探（那会把库建出来）
+        if !db_file.exists() && !log_file.exists() {
+            return Err(format!("database '{}' does not exist", name));
+        }
+
+        // ① 先关再删：Windows 上句柄不释放，remove_file 一定失败。
+        //    失败要把库放回去，否则 registry 丢了一个还开着的库。
+        if let Some(mut db) = self.others.remove(name) {
+            if let Err(e) = db.shutdown() {
+                self.others.insert(name.to_string(), db);
+                return Err(format!("close database '{}': {}", name, e));
+            }
+        }
+        // ② 不在 others 里也能走到这里 —— 懒加载的库从没被打开过，文件必须照删
+
+        // ③ 先删 log 再删 db：避免「旧 WAL + 新建空库」被重放出旧数据
+        if log_file.exists() {
+            std::fs::remove_file(&log_file)
+                .map_err(|e| format!("remove '{}': {}", log_file.display(), e))?;
+        }
+        if db_file.exists() {
+            std::fs::remove_file(&db_file)
+                .map_err(|e| format!("remove '{}': {}", db_file.display(), e))?;
+        }
+        Ok(())
+    }
+
+}
+#[cfg(test)]
+mod drop_db_tests {
+    use super::*;
+
+    #[test]
+    fn test_registry_drop_db() {
+        let main = "./data/test_reg_main";
+        let hot = "./data/test_reg_hot";     // 会被 ensure_open 加载进 others
+        let cold = "./data/test_reg_cold";   // 存在但从未打开
+        let paths = |b: &str| (format!("{}.db", b), format!("{}.log", b));
+        for b in [main, hot, cold] {
+            let (d, l) = paths(b);
+            let _ = std::fs::remove_file(d);
+            let _ = std::fs::remove_file(l);
+        }
+
+        let (md, ml) = paths(main);
+        let db = Database::open_at(&md, &ml).unwrap();
+        let mut reg = DbRegistry::new(db);
+
+        for b in [hot, cold] {
+            let (d, l) = paths(b);
+            let mut t = Database::open_at(&d, &l).unwrap();
+            t.shutdown().unwrap();
+        }
+        // 只让 hot 进 others 缓存，cold 保持"冷"状态
+        reg.ensure_open("test_reg_hot").unwrap();
+
+        assert!(reg.drop_db("test_reg_main").is_err(), "默认库不能删");
+        assert!(reg.drop_db("no_such_db").is_err(), "不存在的库要报错");
+
+        for name in ["test_reg_hot", "test_reg_cold"] {
+            reg.drop_db(name).unwrap();
+        }
+        for base in [hot, cold] {
+            let (d, l) = paths(base);
+            assert!(!std::path::Path::new(&d).exists(), "{} 应已删除", d);
+            assert!(!std::path::Path::new(&l).exists(), "{} 应已删除", l);
+        }
+
+        reg.shutdown();
+        let _ = std::fs::remove_file(md);
+        let _ = std::fs::remove_file(ml);
     }
 }

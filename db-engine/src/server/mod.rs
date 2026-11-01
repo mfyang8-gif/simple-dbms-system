@@ -67,12 +67,25 @@ fn handle_client(stream: TcpStream, reg: Arc<Mutex<DbRegistry>>) -> std::io::Res
         // 锁只包住"执行"，不包住 socket IO（读和写都在锁外）
         let response = {
             let mut guard = reg.lock().unwrap();
-            // 按会话的 current_db 选出要操作的库；默认库同时充当账号库
-            match guard.resolve(session.current_db.as_deref()) {
-                Ok((db, accounts)) => match run_sql(sql, db, accounts, &mut session) {
-                    Ok(rs) => format_result(&rs),
-                    Err(e) => format!("ERR {}", escape_value(&e)),
+
+            let outcome = match guard.resolve(session.current_db.as_deref()) {
+                Ok((db, accounts)) => run_sql(sql, db, accounts, &mut session)
+                    .map(|rs| format_result(&rs)),
+                Err(e) => Err(e),
+            };
+
+            // 延迟动作：上面那个 &mut Database 到这里已经归还，guard 可以再借一次。
+            // 这就是 DROP DATABASE 不能写在 execute 里的原因 —— 那边借不到 registry。
+            let outcome = match outcome {
+                Ok(text) => match session.pending_drop_db.take() {
+                    Some(name) => guard.drop_db(&name).map(|_| text),
+                    None => Ok(text),
                 },
+                Err(e) => Err(e),
+            };
+
+            match outcome {
+                Ok(text) => text,
                 Err(e) => format!("ERR {}", escape_value(&e)),
             }
         };
