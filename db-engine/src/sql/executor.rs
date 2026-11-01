@@ -259,7 +259,8 @@ fn load_view(db: &Database, name: &str) -> Result<Option<ViewMeta>, String> {
 fn execute_create_user(
     name: String,
     password: String,
-    accounts: &mut Database,     // ← 原 db
+    accounts: &mut Database,          // 账号库
+    privs_db: Option<&mut Database>,  // 当前库；None 表示两者是同一个库
     session: &mut Session,
 ) -> Result<ResultSet, String> {
     ensure_users_table(accounts)?;   // ← 原 ensure_internal_tables(db)
@@ -286,12 +287,90 @@ fn execute_create_user(
     // 这是与表数据一致的事务语义，属于可接受边界（要写进报告）。
     accounts.insert_in_txn(&mut users, row, session.txn_id)
         .map_err(|e| format!("create user failed: {}", e))?;
-
+    // 第二层防御：同名用户重建时，旧授权一律作废。
+    // DROP USER 只能清到「当前库」，别的库里的残留在这里被兜住。
+    let pdb = match privs_db { Some(p) => p, None => accounts };
+    cleanup_privs_of(pdb, &name, session)?;
     // 非第一个用户的 admin 校验不在这里做：4-E 的 authorize 统一拦，
     // 避免同一件事写两遍再删一遍。
     Ok(ResultSet::Ok)
 }
+/// 删掉某个用户的全部授权（只在给定库里找）。返回删了几条。
+/// 表不存在 → 说明这个库从没 GRANT 过，直接返回 0，不要顺手建表。
+fn cleanup_privs_of(db: &mut Database, user: &str, session: &mut Session) -> Result<usize, String> {
+    if db.get_table_meta(PRIVS_TABLE).is_none() {
+        return Ok(0);
+    }
+    let mut t = db.open_table(PRIVS_TABLE).map_err(|e| e.to_string())?;
 
+    let mut doomed: Vec<RowId> = Vec::new();
+    for (rid, rec) in t.scan_all().map_err(|e| e.to_string())? {
+        let vals = decode_row(&t, &rec)?;
+        if let Some(Value::Str(u)) = vals.get(1) {
+            if u == user {
+                doomed.push(rid);
+            }
+        }
+    }
+
+    let n = doomed.len();
+    for rid in doomed {
+        t.delete(rid, db.txn_mgr(), session.txn_id)
+            .map_err(|e| format!("cleanup privilege failed: {}", e))?;
+    }
+    Ok(n)
+}
+
+/// DROP USER bob
+/// 不变量：① 不能删自己 ② 不能删掉最后一个 admin ③ 级联清当前库授权
+fn execute_drop_user(
+    name: String,
+    accounts: &mut Database,
+    privs_db: Option<&mut Database>,
+    session: &mut Session,
+) -> Result<ResultSet, String> {
+    if accounts.get_table_meta(USERS_TABLE).is_none() {
+        return Err(format!("user '{}' does not exist", name));
+    }
+    let mut users = accounts.open_table(USERS_TABLE).map_err(|e| e.to_string())?;
+
+    // 一次扫描同时拿到：目标行、管理员总数、目标是不是管理员
+    let mut doomed: Option<RowId> = None;
+    let mut admin_count = 0usize;
+    let mut target_is_admin = false;
+    for (rid, rec) in users.scan_all().map_err(|e| e.to_string())? {
+        let vals = decode_row(&users, &rec)?;
+        let (u, adm) = match (vals.first(), vals.get(2)) {
+            (Some(Value::Str(u)), Some(Value::Int(a))) => (u, *a != 0),
+            _ => continue,
+        };
+        if adm { admin_count += 1; }
+        if u == &name {
+            doomed = Some(rid);
+            target_is_admin = adm;
+        }
+    }
+
+    let rid = doomed.ok_or_else(|| format!("user '{}' does not exist", name))?;
+
+    // ① 不能删自己
+    if session.user.as_deref() == Some(name.as_str()) {
+        return Err("cannot drop the user you are logged in as".into());
+    }
+    // ② 不能删掉最后一个 admin（当前模型下它必然就是自己，但这条是不变量，留着）
+    if target_is_admin && admin_count <= 1 {
+        return Err("cannot drop the last admin".into());
+    }
+
+    users.delete(rid, accounts.txn_mgr(), session.txn_id)
+        .map_err(|e| format!("drop user failed: {}", e))?;
+
+    // ③ 级联：清当前库的授权（跨库残留由 CREATE USER 那层兜）
+    let pdb = match privs_db { Some(p) => p, None => accounts };
+    cleanup_privs_of(pdb, &name, session)?;
+
+    Ok(ResultSet::Ok)
+}
 fn execute_login(
     name: String,
     password: String,
@@ -594,12 +673,12 @@ fn authorize(
         Statement::Delete { .. } => Some(Priv::Delete),
         // DDL / DCL：不存在“表级权限”，只有 admin 能做
         Statement::CreateTable { .. } | Statement::DropTable { .. }
-        | Statement::CreateUser { .. } | Statement::Grant { .. } | Statement::Revoke { .. }
-        // 建库不是“对某张表的权限”，只有 admin 能做（靠 ⑦ 的 (_, None) 分支）
+        | Statement::CreateUser { .. } | Statement::DropUser { .. }
+        | Statement::Grant { .. } | Statement::Revoke { .. }
+        // 建库 / 建视图 / 删视图：名字都不是表名，走「admin required」
         | Statement::CreateDatabase { .. }
-        // 建视图同理：视图名不是表名，走“admin required”
-        | Statement::CreateDatabase { .. } => None,
-        Statement::CreateView { .. } => None,
+        | Statement::CreateView { .. }
+        | Statement::DropView { .. } => None,
 
 
     };
@@ -611,12 +690,10 @@ fn authorize(
         | Statement::Grant { table, .. } | Statement::Revoke { table, .. } => Some(table),
         Statement::CreateTable { name, .. } => Some(name),
         Statement::DropTable { name } => Some(name),
-        Statement::CreateUser { .. } | Statement::Login { .. }
+        Statement::CreateUser { .. } | Statement::DropUser { .. } | Statement::Login { .. }
         | Statement::Begin | Statement::Commit | Statement::Rollback
-        // 库名不是表名，不能塞进 touched（否则会误触内部表前缀检查）
-
-        // 视图名也不是表名；它引用的基表在 Step 4 单独校验
-        | Statement::CreateView { .. } => None,
+        // 库名 / 视图名 / 用户名都不是表名，不能塞进 touched
+        | Statement::CreateView { .. } | Statement::DropView { .. } => None,
         | Statement::CreateDatabase { .. } | Statement::Use { .. } => None,
     };
 
@@ -852,12 +929,19 @@ pub fn execute(
             session.txn_id = None;
             Ok(ResultSet::Ok)
         }
+        Statement::DropView { name } => execute_drop_view(name, db, session),
         Statement::Update { table, assignments, filter } => execute_update(table, assignments, filter, db, session),
         Statement::CreateUser { name, password } => {
             // accounts 为 None 时，账号库就是当前库
-            let acc = accounts.unwrap_or(db);
-            execute_create_user(name, password, acc, session)
+            match accounts {
+                Some(acc) => execute_create_user(name, password, acc, Some(db), session),
+                None => execute_create_user(name, password, db, None, session),
+            }
         }
+        Statement::DropUser { name } => match accounts {
+            Some(acc) => execute_drop_user(name, acc, Some(db), session),
+            None => execute_drop_user(name, db, None, session),
+        },
         Statement::Login { name, password } => {
             execute_login(name, password, accounts.as_deref().unwrap_or(db), session)
         }
@@ -984,7 +1068,35 @@ fn execute_create_view(
     Ok(ResultSet::Ok)
 }
 fn execute_drop_table(name: String, db: &mut Database) -> Result<ResultSet, String> {
+    // 视图不是表：给一句能指导下一步的提示
+    if db.get_table_meta(&name).is_none() && load_view(db, &name)?.is_some() {
+        return Err(format!("'{}' is a view, use DROP VIEW", name));
+    }
     db.drop_table(&name).map_err(|e| format!("drop_table failed: {}", e))?;
+    Ok(ResultSet::Ok)
+}
+
+/// DROP VIEW v —— 只删 __minidb_views 里那一行，基表数据一行不动。
+fn execute_drop_view(name: String, db: &mut Database, session: &mut Session) -> Result<ResultSet, String> {
+    if db.get_table_meta(VIEWS_TABLE).is_none() {
+        return Err(format!("view '{}' does not exist", name));
+    }
+    let mut views = db.open_table(VIEWS_TABLE).map_err(|e| e.to_string())?;
+
+    let mut doomed: Option<RowId> = None;
+    for (rid, rec) in views.scan_all().map_err(|e| e.to_string())? {
+        let vals = decode_row(&views, &rec)?;
+        if let Some(Value::Str(n)) = vals.first() {
+            if n.as_str() == name {
+                doomed = Some(rid);
+                break;
+            }
+        }
+    }
+    let rid = doomed.ok_or_else(|| format!("view '{}' does not exist", name))?;
+
+    views.delete(rid, db.txn_mgr(), session.txn_id)
+        .map_err(|e| format!("drop view failed: {}", e))?;
     Ok(ResultSet::Ok)
 }
 fn execute_insert(
@@ -3680,5 +3792,78 @@ mod tests {
         let _ = main_db.shutdown();
         drop(main_db);
         let _ = std::fs::remove_dir_all(MULTI_DIR);
+    }
+    #[test]
+    fn test_e2e_drop_user() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        // 第一个用户自动成为 admin
+        exec_sql(&mut db, &mut session, "CREATE USER alice PASSWORD 'pw'").unwrap();
+        exec_sql(&mut db, &mut session, "LOGIN alice PASSWORD 'pw'").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE TABLE du_t (id INT)").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE USER bob PASSWORD 'pw2'").unwrap();
+        exec_sql(&mut db, &mut session, "GRANT SELECT ON du_t TO bob").unwrap();
+
+        // ① 不能删自己
+        assert_err_contains(exec_sql(&mut db, &mut session, "DROP USER alice"), "logged in as");
+        // ② 不存在的用户
+        assert_err_contains(exec_sql(&mut db, &mut session, "DROP USER nosuch"), "does not exist");
+
+        // ③ 删除成功，并且 bob 的授权被级联清空
+        exec_sql(&mut db, &mut session, "DROP USER bob").unwrap();
+        match exec_sql(&mut db, &mut session, "SELECT username FROM __minidb_privs").unwrap() {
+            ResultSet::Rows { rows, .. } => assert!(rows.is_empty(), "bob 的授权应被清空"),
+            other => panic!("got {:?}", other),
+        }
+
+        // ④ 重建同名用户 → 第二层防御：不能继承旧权限
+        exec_sql(&mut db, &mut session, "CREATE USER bob PASSWORD 'pw3'").unwrap();
+        exec_sql(&mut db, &mut session, "LOGIN bob PASSWORD 'pw3'").unwrap();
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT * FROM du_t"),
+                            "permission denied");
+
+        let _ = db.shutdown();
+    }
+    #[test]
+    fn test_e2e_drop_view() {
+        let _guard = db_lock();
+        let mut db = open_test_db();
+        let mut session = Session::new();
+
+        exec_sql(&mut db, &mut session,
+                 "CREATE TABLE dv_t (id INT PRIMARY KEY, age INT)").unwrap();
+        exec_sql(&mut db, &mut session, "INSERT INTO dv_t VALUES (1, 20)").unwrap();
+        exec_sql(&mut db, &mut session, "CREATE VIEW dv_v AS SELECT id FROM dv_t").unwrap();
+
+        // 删之前能查
+        match exec_sql(&mut db, &mut session, "SELECT * FROM dv_v").unwrap() {
+            ResultSet::Rows { rows, .. } => assert_eq!(cells_all(&rows), vec![vec!["1".to_string()]]),
+            other => panic!("got {:?}", other),
+        }
+
+        // 删视图只动元数据，基表数据必须还在
+        exec_sql(&mut db, &mut session, "DROP VIEW dv_v").unwrap();
+        match exec_sql(&mut db, &mut session, "SELECT id FROM dv_t").unwrap() {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(cells_all(&rows), vec![vec!["1".to_string()]], "基表不该被牵连")
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // 视图没了：查询退化成「表不存在」（走的是 open_table 的原始文案）
+        assert_err_contains(exec_sql(&mut db, &mut session, "SELECT * FROM dv_v"),
+                            "not found");
+        // 重复删 → 明确说视图不存在
+        assert_err_contains(exec_sql(&mut db, &mut session, "DROP VIEW dv_v"),
+                            "view 'dv_v' does not exist");
+
+        // 用 DROP TABLE 删视图 → 提示正确命令
+        exec_sql(&mut db, &mut session, "CREATE VIEW dv_v2 AS SELECT id FROM dv_t").unwrap();
+        assert_err_contains(exec_sql(&mut db, &mut session, "DROP TABLE dv_v2"),
+                            "use DROP VIEW");
+
+        let _ = db.shutdown();
     }
 }

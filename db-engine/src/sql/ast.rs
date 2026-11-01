@@ -9,9 +9,20 @@ pub enum Statement {
         columns: Vec<ColumnDef>,
     },
     /// DROP TABLE users
+    /// DROP TABLE users
     DropTable {
         name: String,
     },
+    /// DROP VIEW v —— 只删视图定义，不碰基表数据
+    DropView {
+        name: String,
+    },
+    /// DROP USER bob
+    DropUser {
+        name: String,
+    },
+
+    
     /// INSERT INTO users (id, name) VALUES (1, 'Alice')
     /// INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')
     Insert {

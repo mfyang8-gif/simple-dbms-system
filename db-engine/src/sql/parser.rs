@@ -32,7 +32,7 @@ impl Parser {
             Token::Update  => self.parse_update(),
             Token::Delete  => self.parse_delete(),
             Token::Create  => self.parse_create(),
-            Token::Drop    => self.parse_drop_table(),
+            Token::Drop    => self.parse_drop(),
             Token::Begin   => { self.advance(); Ok(Statement::Begin) }
             Token::Commit  => { self.advance(); Ok(Statement::Commit) }
             Token::Grant   => self.parse_grant(),    // ← 新增
@@ -427,16 +427,24 @@ impl Parser {
         Ok(Statement::CreateTable { name, columns })
     }
 
-    fn parse_drop_table(&mut self) -> Result<Statement, String> {
-        // expect(Drop)
+    /// DROP 家族：TABLE / VIEW / USER，只差第二个关键字
+    fn parse_drop(&mut self) -> Result<Statement, String> {
         self.expect(&Token::Drop)?;
-        // expect(Table)
-        self.expect(&Token::Table)?;
-        // name = expect_ident()
-        let name = self.expect_ident()?;
-        // Ok(Statement::DropTable { name })
-        Ok(Statement::DropTable { name })
 
+        if self.peek() == &Token::View {
+            self.advance();
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropView { name });
+        }
+        if self.peek() == &Token::User {
+            self.advance();
+            let name = self.expect_ident()?;
+            return Ok(Statement::DropUser { name });
+        }
+
+        self.expect(&Token::Table)?;
+        let name = self.expect_ident()?;
+        Ok(Statement::DropTable { name })
     }
     /// 读一个权限关键字 → Priv。
     /// 注意这里 match 的是 Token，不是字符串：lexer 已经把 SELECT 升格成 Token::Select 了。
