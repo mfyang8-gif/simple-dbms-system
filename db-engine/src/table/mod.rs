@@ -822,6 +822,62 @@ impl Table {
             }
         }
     }
+
+    /// 原地改写 row_id 那一格。
+    /// `Ok(true)` = 已原地覆盖；`Ok(false)` = 记录变长放不下，**页里一个字节都没动**。
+    pub fn try_update_in_place(
+        &mut self,
+        row_id: RowId,
+        row: &Row,
+        txn_mgr: &Arc<Mutex<TransactionManager>>,
+        txn: Option<TxnId>,
+    ) -> std::io::Result<bool> {
+        let record = row.to_record()?;
+
+        // 先量长度再开事务：变长时直接返回，不产生一对空的 Begin/Commit 日志
+        let old_len = self.read(row_id)?.data().len();
+        if record.data().len() > old_len {
+            return Ok(false);
+        }
+
+        // 与 delete/insert_raw 同一套事务上下文
+        let (txn_id, start_lsn, auto_commit) = match txn {
+            Some(id) => (id, txn_mgr.lock().unwrap().last_lsn(id), false),
+            None => {
+                let (id, lsn) = txn_mgr.lock().unwrap().begin();
+                (id, lsn, true)
+            }
+        };
+        let mut wal = page_ops::WalContext::with_txn(self.buffer_pool.log_manager().clone(), txn_id, start_lsn);
+
+        let result = page_ops::update_record(
+            &mut self.buffer_pool.fetch_page(row_id.page_id)?.write().unwrap(),
+            row_id.slot_id,
+            &record,
+            &mut wal,
+        );
+        match result {
+            // 原地成功：行数不变，record_count 不动
+            Ok(true) => {
+                Self::finish_stmt(txn_mgr, txn_id, wal.last_lsn(), auto_commit);
+                Ok(true)
+            }
+            // 兜底（理论上不会走到）：事务收尾后交给调用方删+插
+            Ok(false) => {
+                Self::finish_stmt(txn_mgr, txn_id, wal.last_lsn(), auto_commit);
+                Ok(false)
+            }
+            Err(e) => {
+                if auto_commit {
+                    txn_mgr.lock().unwrap().abort(txn_id);
+                } else {
+                    txn_mgr.lock().unwrap().set_last_lsn(txn_id, wal.last_lsn());
+                }
+                Err(e)
+            }
+        }
+    }
+
     pub fn scan_all(&self) -> std::io::Result<Vec<(RowId, Record)>> {
         let mut results = Vec::new();
         for &page_id in &self.data_pages {

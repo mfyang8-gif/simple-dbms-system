@@ -226,7 +226,60 @@ pub fn delete_record(page: &mut Page, slot: SlotId, wal: &mut WalContext) -> std
     Ok(())
 }
 
+/// 原地改写一条记录：只动**数据区**和**槽长度**，不碰页头（行数没变）。
+///
+/// # Returns
+/// - `Ok(true)`  — 已原地覆盖
+/// - `Ok(false)` — 新记录比旧的长，右边是别的记录，长不出来；调用方退化成删+插
+///
+/// 【空间代价】变短时尾部会留下 (old_len - new_len) 字节的洞。
+/// 页头只跟踪 free_space_start/end，洞要等 compact 才回收，
+/// 而 compact 目前只在有墓碑时触发 —— 这个限制写进报告。
+pub fn update_record(
+    page: &mut Page,
+    slot: SlotId,
+    record: &Record,
+    wal: &mut WalContext,
+) -> std::io::Result<bool> {
+    let header = PageHeader::read_from_page(page);
+    let slot = slot as usize;
+    if slot >= header.slot_count as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Slot {} out of range [0..{})", slot, header.slot_count),
+        ));
+    }
+
+    let (offset, old_len) = read_slot(page, slot);
+    if offset == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Slot {} is a tombstone (deleted)", slot),
+        ));
+    }
+
+    let data = record.data();
+    let new_len = data.len() as u16;
+    if new_len > old_len {
+        return Ok(false);   // 一个字节都还没改
+    }
+
+    // ① 数据区原地覆盖（只写 new_len 字节，尾部残留不动）
+    logged_write(page, wal, offset as usize, data);
+
+    // ② 长度变了才改槽。等长时槽内容没变，不写这条冗余日志
+    if new_len != old_len {
+        logged_write(page, wal, slot_offset_in_page(slot), &slot_bytes(offset, new_len));
+    }
+
+    // ③ 点亮 pageLSN
+    PageHeader::write_page_lsn(page, wal.last_lsn());
+
+    Ok(true)
+}
+
 /// 扫描页中所有存活的记录（只读，不产生日志）
+
 pub fn scan_page(page: &Page) -> Vec<(SlotId, Record)> {
     let header = PageHeader::read_from_page(page);
     let mut records = Vec::new();
